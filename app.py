@@ -6,20 +6,21 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 import datetime
 import threading
+import time
 from twilio.rest import Client
 
 app = Flask(__name__)
 
-# --- Configurazione Twilio ---
+# Twilio setup
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-# --- Configurazione OpenAI ---
+# OpenAI setup
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# --- Configurazione Google Calendar ---
+# Google Calendar setup
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 SERVICE_ACCOUNT_FILE = 'credentials.json'
 credentials = service_account.Credentials.from_service_account_file(
@@ -27,7 +28,7 @@ credentials = service_account.Credentials.from_service_account_file(
 calendar_service = build('calendar', 'v3', credentials=credentials)
 CALENDAR_ID = 'primary'
 
-# --- Servizi e prezzi ---
+# Servizi e prezzi
 SERVIZI = {
     "taglio prato": 25,
     "potatura siepi": 30,
@@ -39,27 +40,18 @@ SERVIZI = {
     "smaltimento verde": 15
 }
 
-# --- Date disponibili di esempio ---
+# Date disponibili (esempio)
 DISPONIBILITA = [
     "2025-12-10T10:00:00",
     "2025-12-10T14:00:00",
     "2025-12-11T09:00:00"
 ]
 
-# --- Sessioni utenti ---
+# Sessioni utenti per preventivi e appuntamenti
 SESSIONS = {}
 APPUNTAMENTI = []
 
-# --- Funzione intelligente per ChatGPT ---
-def gpt_rispondi(messaggio):
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": messaggio}],
-        max_tokens=300
-    )
-    return response.choices[0].message.content.strip()
-
-# --- Thread per promemoria ---
+# Thread per inviare promemoria
 def promemoria_worker():
     while True:
         now = datetime.datetime.now()
@@ -67,7 +59,7 @@ def promemoria_worker():
             dt_app = appu['datetime']
             numero = appu['numero']
             inviato = appu.get('reminder_sent', False)
-            if not inviato and 0 <= (dt_app - now).total_seconds() <= 86400:
+            if not inviato and 0 <= (dt_app - now).total_seconds() <= 86400:  # 24h prima
                 messaggio = f"Promemoria: il tuo appuntamento per {appu['servizio']} è domani alle {dt_app.strftime('%H:%M')}."
                 twilio_client.messages.create(
                     body=messaggio,
@@ -75,106 +67,111 @@ def promemoria_worker():
                     to=numero
                 )
                 appu['reminder_sent'] = True
-        threading.Event().wait(3600)
+        time.sleep(3600)
 
 threading.Thread(target=promemoria_worker, daemon=True).start()
 
-# --- Funzione per estrarre il servizio dal messaggio ---
+def chiedi_gpt(prompt, max_tokens=300):
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens
+    )
+    return response.choices[0].message.content.strip()
+
 def estrai_servizio(msg):
-    for servizio in SERVIZI.keys():
-        if servizio in msg.lower():
-            return servizio
+    prompt = f"Identifica se il seguente messaggio contiene uno dei servizi: {', '.join(SERVIZI.keys())}. " \
+             f"Rispondi solo con il nome del servizio o 'nessuno'. Testo: {msg}"
+    servizio = chiedi_gpt(prompt, max_tokens=20).lower()
+    if servizio in SERVIZI:
+        return servizio
     return None
 
-# --- Endpoint WhatsApp ---
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_bot():
     from_number = request.form.get('From')
-    msg = request.form.get('Body', '')
+    msg = request.form.get('Body', '').strip()
     response = MessagingResponse()
     session = SESSIONS.get(from_number, {"step": 0})
 
-    # Step 0: iniziale
-    if session["step"] == 0:
-        session["step"] = 1
+    # Controlla se l'utente è in un flusso di preventivo/appuntamento
+    if session["step"] in [1,2,3]:
+        if session["step"] == 1:
+            servizio = estrai_servizio(msg)
+            if servizio:
+                session["servizio"] = servizio
+                reply = f"Perfetto! Quante ore pensi ci vorranno per {servizio}? (es. 2 o 3.5)"
+                session["step"] = 2
+            else:
+                reply = "Non ho capito il servizio. Puoi scrivere ad esempio: potatura siepi, taglio prato, potatura su corda..."
+        elif session["step"] == 2:
+            try:
+                ore = float(msg)
+                session["ore"] = ore
+                prezzo = SERVIZI[session['servizio']] * ore
+                session["prezzo"] = prezzo
+                reply = f"Il preventivo per {session['servizio']} è:\n\n👉 {ore}h × {SERVIZI[session['servizio']]} €/h = {prezzo}€\n"
+                reply += "Vuoi anche prenotare un appuntamento? Rispondi con 'sì' o 'no'."
+                session["step"] = 3
+            except:
+                reply = "Per favore indica le ore come numero (es. 2 o 3.5)."
+        elif session["step"] == 3:
+            if msg.lower() in ["sì","si","ok","yes"]:
+                reply = "Ecco le date disponibili:\n"
+                for i,d in enumerate(DISPONIBILITA):
+                    dt = datetime.datetime.fromisoformat(d)
+                    reply += f"{i+1}. {dt.strftime('%d/%m/%Y %H:%M')}\n"
+                reply += "Rispondi con il numero della data che preferisci."
+                session["step"] = 4
+            else:
+                reply = "Va bene, se vuoi un preventivo o un appuntamento scrivimi!"
+                session["step"] = 0
+        elif session["step"] == 4:
+            try:
+                scelta = int(msg)-1
+                data_scelta = DISPONIBILITA[scelta]
+                dt_start = datetime.datetime.fromisoformat(data_scelta)
+                dt_end = dt_start + datetime.timedelta(hours=session["ore"])
+                # Inserisci evento su Google Calendar
+                event = {
+                    'summary': f"{session['servizio']} - Cliente WhatsApp",
+                    'start': {'dateTime': dt_start.isoformat(), 'timeZone': 'Europe/Rome'},
+                    'end': {'dateTime': dt_end.isoformat(), 'timeZone': 'Europe/Rome'},
+                }
+                calendar_service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
+                # Aggiungi promemoria
+                APPUNTAMENTI.append({
+                    'numero': from_number,
+                    'servizio': session['servizio'],
+                    'datetime': dt_start,
+                    'reminder_sent': False
+                })
+                reply = f"Appuntamento confermato per {session['servizio']} il {dt_start.strftime('%d/%m/%Y %H:%M')} ✅"
+                session["step"] = 0
+            except:
+                reply = "Non ho capito la scelta. Rispondi con il numero della data disponibile."
         SESSIONS[from_number] = session
-        response.message("Ciao! Vuoi ricevere un preventivo, prenotare un appuntamento o fare una domanda?")
+        response.message(reply)
         return str(response)
 
-    # Step 1: capire cosa vuole
-    scelta = msg.lower()
-    if "preventivo" in scelta:
-        session["step"] = 2
+    # Flusso generale: riconosce intent e risponde
+    if any(k in msg.lower() for k in ["preventivo","prezzo","quanto costa"]):
+        session["step"] = 1
         SESSIONS[from_number] = session
         response.message("Perfetto! Quale servizio ti interessa?")
         return str(response)
-    elif "prenotare" in scelta or "appuntamento" in scelta:
-        session["step"] = 3
+    elif any(k in msg.lower() for k in ["prenota","appuntamento","quando sei libero"]):
+        session["step"] = 1
         SESSIONS[from_number] = session
-        response.message("Quale servizio vuoi prenotare?")
+        response.message("Perfetto! Quale servizio vuoi prenotare?")
         return str(response)
     else:
-        # Risposta libera intelligente
-        reply = gpt_rispondi(msg)
+        # Risposta libera con GPT
+        prompt = f"Sei un assistente di giardinaggio esperto. Rispondi in modo chiaro ed educato alla domanda: {msg}"
+        reply = chiedi_gpt(prompt)
         response.message(reply)
         return str(response)
 
-    # Step 2: preventivo
-    if session["step"] == 2:
-        servizio = estrai_servizio(msg)
-        if servizio:
-            session["servizio"] = servizio
-            prezzo = SERVIZI[servizio]
-            reply = f"Il prezzo orario per {servizio} è {prezzo} €/h. Quante ore pensi siano necessarie?"
-            session["step"] = 4
-        else:
-            reply = "Non ho capito il servizio. Puoi scrivere esattamente il nome del servizio tra: " + ", ".join(SERVIZI.keys())
-        SESSIONS[from_number] = session
-        response.message(reply)
-        return str(response)
-
-    # Step 4: ricevo ore e calcolo preventivo
-    if session["step"] == 4:
-        try:
-            ore = float(msg)
-            session["ore"] = ore
-            prezzo_totale = SERVIZI[session['servizio']] * ore
-            reply = f"Il preventivo per {session['servizio']} è:\n👉 {ore}h × {SERVIZI[session['servizio']]} €/h = {prezzo_totale} €\nVuoi anche prenotare un appuntamento?"
-            session["step"] = 3
-        except:
-            reply = "Inserisci un numero valido di ore."
-        SESSIONS[from_number] = session
-        response.message(reply)
-        return str(response)
-
-    # Step 3: prenotazione appuntamento
-    if session["step"] == 3:
-        servizio = estrai_servizio(msg)
-        if servizio:
-            session["servizio"] = servizio
-            # Prende prima data disponibile
-            dt_start = datetime.datetime.fromisoformat(DISPONIBILITA[0])
-            dt_end = dt_start + datetime.timedelta(hours=1)
-            event = {
-                'summary': f"{session['servizio']} - Cliente WhatsApp",
-                'start': {'dateTime': dt_start.isoformat(), 'timeZone': 'Europe/Rome'},
-                'end': {'dateTime': dt_end.isoformat(), 'timeZone': 'Europe/Rome'},
-            }
-            calendar_service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-            APPUNTAMENTI.append({
-                'numero': from_number,
-                'servizio': session['servizio'],
-                'datetime': dt_start,
-                'reminder_sent': False
-            })
-            reply = f"Appuntamento confermato per {session['servizio']} il {dt_start.strftime('%d/%m/%Y %H:%M')}."
-            session["step"] = 0
-        else:
-            reply = "Non ho capito il servizio. Scrivilo esattamente tra: " + ", ".join(SERVIZI.keys())
-        SESSIONS[from_number] = session
-        response.message(reply)
-        return str(response)
-
-# --- Avvio app ---
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
