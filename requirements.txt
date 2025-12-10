@@ -1,4 +1,4 @@
-flask>=2.2.5
+flask>=2.2
 gunicorn
 twilio
 openai>=1.0.0
@@ -6,3 +6,5 @@ python-dotenv
 google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
+requests
+
