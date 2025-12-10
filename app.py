@@ -5,9 +5,13 @@ import os
 
 app = Flask(__name__)
 
-# OpenAI client
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# ✅ OpenAI client
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("Devi impostare la variabile OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
+# Dizionario servizi e prezzi
 SERVICES = {
     "taglio prato": 25,
     "potatura siepi": 30,
@@ -20,49 +24,55 @@ SERVICES = {
 }
 
 def analyze_message(user_message):
-    """Usa GPT-4o mini per capire cosa vuole il cliente."""
+    """
+    Analizza il messaggio dell'utente usando GPT-4o-mini
+    e decide se rispondere a domande, preventivi o appuntamenti.
+    """
     prompt = f"""
-Sei un assistente per un giardiniere professionista.
+Sei un assistente virtuale per un giardiniere professionista. 
+Il tuo compito è rispondere in modo naturale, chiaro, conversazionale e professionale.
 
-1. Analizza il messaggio dell’utente qui sotto.
-2. Capisci TUTTE le intenzioni presenti (es: domanda botanica, preventivo, appuntamento).
-3. Estrai eventuali servizi (dal dizionario più sotto) anche se scritti in modo non preciso.
-4. Se l’utente chiede informazioni su piante, rispondi con competenza reale.
-5. Se chiede preventivo: calcola un preventivo realistico basato sui servizi.
-6. Se chiede appuntamento: chiedi solo data/ora.
-7. Rispondi in modo naturale, come ChatGPT, conversazionale e intelligente.
+1. Identifica le intenzioni dell'utente: domanda botanica, preventivo, appuntamento.
+2. Se menziona un servizio dal dizionario sottostante, calcola eventuali preventivi.
+3. Se chiede appuntamento, richiedi solo data/ora.
+4. Rispondi anche a domande su piante o giardinaggio con competenza reale.
+5. Mantieni sempre un tono amichevole ma professionale.
 
-📌 Dizionario servizi disponibili:
+📌 Servizi disponibili e prezzi €/h:
 {SERVICES}
 
-📌 Messaggio utente:
---------------------
+📌 Messaggio dell'utente:
+------------------------
 {user_message}
---------------------
+------------------------
 
-Genera una risposta finale naturale, chiara, amichevole MA PROFESSIONALE.
+Rispondi con una sola risposta completa, chiara e naturale.
 """
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500
+        )
+        return completion.choices[0].message["content"].strip()
+    except Exception as e:
+        return f"Errore nel generare la risposta: {str(e)}"
 
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    return completion.choices[0].message["content"]
-
-@app.route("/whatsapp", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def whatsapp_bot():
     user_message = request.form.get("Body")
+    if not user_message:
+        user_message = "Ciao"
+
     reply_text = analyze_message(user_message)
 
     response = MessagingResponse()
     response.message(reply_text)
     return str(response)
 
-
 @app.route("/")
 def home():
-    return "Bot attivo."
+    return "Bot attivo e pronto a ricevere messaggi WhatsApp!"
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
