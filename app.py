@@ -2,6 +2,7 @@ from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from openai import OpenAI
 import os
+from collections import defaultdict
 
 app = Flask(__name__)
 
@@ -11,7 +12,7 @@ if not OPENAI_API_KEY:
     raise ValueError("Devi impostare la variabile OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Dizionario servizi e prezzi
+# Servizi disponibili e prezzi €/h
 SERVICES = {
     "taglio prato": 25,
     "potatura siepi": 30,
@@ -23,48 +24,58 @@ SERVICES = {
     "smaltimento verde": 30
 }
 
-def analyze_message(user_message):
+# Memoria sessione utenti (telefono -> storia conversazione)
+user_sessions = defaultdict(list)
+
+def analyze_message(user_message, session_history):
     """
-    Analizza il messaggio dell'utente usando GPT-4o-mini
-    e decide se rispondere a domande, preventivi o appuntamenti.
+    Usa GPT-4o-mini per analizzare il messaggio e rispondere in modo intelligente.
     """
+    # Aggiunge il messaggio alla storia
+    session_history.append({"role": "user", "content": user_message})
+
+    # Prompt base con istruzioni
     prompt = f"""
-Sei un assistente virtuale per un giardiniere professionista. 
-Il tuo compito è rispondere in modo naturale, chiaro, conversazionale e professionale.
+Sei un assistente virtuale professionale per giardinieri. Analizza le richieste dell'utente e rispondi in modo naturale e chiaro.
 
-1. Identifica le intenzioni dell'utente: domanda botanica, preventivo, appuntamento.
-2. Se menziona un servizio dal dizionario sottostante, calcola eventuali preventivi.
-3. Se chiede appuntamento, richiedi solo data/ora.
-4. Rispondi anche a domande su piante o giardinaggio con competenza reale.
-5. Mantieni sempre un tono amichevole ma professionale.
+1. Identifica tutte le intenzioni dell'utente: domanda botanica, preventivo, appuntamento.
+2. Estrai eventuali servizi citati nel dizionario sottostante anche se scritti in modo approssimativo.
+3. Se l'utente chiede preventivo, calcola costo realistico in base ai servizi menzionati.
+4. Se l'utente vuole prenotare un appuntamento, chiedi solo data e ora.
+5. Mantieni un tono amichevole ma professionale.
+6. Rispondi come farebbe ChatGPT.
 
-📌 Servizi disponibili e prezzi €/h:
+📌 Servizi e prezzi €/h:
 {SERVICES}
 
-📌 Messaggio dell'utente:
-------------------------
-{user_message}
-------------------------
+📌 Conversazione finora:
+{session_history}
 
-Rispondi con una sola risposta completa, chiara e naturale.
+Rispondi con una risposta completa, chiara e naturale.
 """
     try:
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500
+            messages=session_history + [{"role": "user", "content": prompt}],
+            max_tokens=600
         )
-        return completion.choices[0].message["content"].strip()
+        reply = completion.choices[0].message["content"].strip()
+        # Aggiunge la risposta alla storia
+        session_history.append({"role": "assistant", "content": reply})
+        return reply
     except Exception as e:
         return f"Errore nel generare la risposta: {str(e)}"
 
 @app.route("/webhook", methods=["POST"])
 def whatsapp_bot():
     user_message = request.form.get("Body")
-    if not user_message:
-        user_message = "Ciao"
+    from_number = request.form.get("From")  # numero utente WhatsApp
 
-    reply_text = analyze_message(user_message)
+    if not user_message or not from_number:
+        return "Messaggio o numero utente non disponibile.", 400
+
+    session_history = user_sessions[from_number]  # recupera conversazione precedente
+    reply_text = analyze_message(user_message, session_history)
 
     response = MessagingResponse()
     response.message(reply_text)
@@ -72,7 +83,7 @@ def whatsapp_bot():
 
 @app.route("/")
 def home():
-    return "Bot attivo e pronto a ricevere messaggi WhatsApp!"
+    return "Bot avanzato attivo e pronto a ricevere messaggi WhatsApp!"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
