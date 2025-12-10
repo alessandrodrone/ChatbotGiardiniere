@@ -1,160 +1,68 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-from twilio.rest import Client
-import openai
+from openai import OpenAI
 import os
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-import datetime
-import threading
-import time
 
 app = Flask(__name__)
 
-# Twilio setup
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+# OpenAI client
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# OpenAI setup
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-# Google Calendar setup
-SCOPES = ['https://www.googleapis.com/auth/calendar']
-SERVICE_ACCOUNT_FILE = 'credentials.json'
-credentials = service_account.Credentials.from_service_account_file(
-    SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-calendar_service = build('calendar', 'v3', credentials=credentials)
-CALENDAR_ID = 'primary'
-
-# Servizi e prezzi
-SERVIZI = {
+SERVICES = {
     "taglio prato": 25,
     "potatura siepi": 30,
     "potatura alberi": 35,
     "potatura su corda": 60,
-    "trattamenti antiparassitari": 20,
-    "pulizia giardino": 20,
-    "raccolta foglie": 15,
-    "smaltimento verde": 15
+    "trattamenti antiparassitari": 40,
+    "pulizia giardino": 28,
+    "raccolta foglie": 25,
+    "smaltimento verde": 30
 }
 
-# Disponibilità esempio
-DISPONIBILITA = [
-    "2025-12-10T10:00:00",
-    "2025-12-10T14:00:00",
-    "2025-12-11T09:00:00"
-]
+def analyze_message(user_message):
+    """Usa GPT-4o mini per capire cosa vuole il cliente."""
+    prompt = f"""
+Sei un assistente per un giardiniere professionista.
 
-SESSIONS = {}
-APPUNTAMENTI = []
+1. Analizza il messaggio dell’utente qui sotto.
+2. Capisci TUTTE le intenzioni presenti (es: domanda botanica, preventivo, appuntamento).
+3. Estrai eventuali servizi (dal dizionario più sotto) anche se scritti in modo non preciso.
+4. Se l’utente chiede informazioni su piante, rispondi con competenza reale.
+5. Se chiede preventivo: calcola un preventivo realistico basato sui servizi.
+6. Se chiede appuntamento: chiedi solo data/ora.
+7. Rispondi in modo naturale, come ChatGPT, conversazionale e intelligente.
 
-# Thread per promemoria 24h prima
-def promemoria_worker():
-    while True:
-        now = datetime.datetime.now()
-        for appu in APPUNTAMENTI:
-            dt_app = appu['datetime']
-            numero = appu['numero']
-            inviato = appu.get('reminder_sent', False)
-            if not inviato and 0 <= (dt_app - now).total_seconds() <= 86400:
-                messaggio = f"Promemoria: il tuo appuntamento per {appu['servizio']} è domani alle {dt_app.strftime('%H:%M')}."
-                twilio_client.messages.create(
-                    body=messaggio,
-                    from_=f'whatsapp:{TWILIO_WHATSAPP_NUMBER}',
-                    to=numero
-                )
-                appu['reminder_sent'] = True
-        time.sleep(3600)
+📌 Dizionario servizi disponibili:
+{SERVICES}
 
-threading.Thread(target=promemoria_worker, daemon=True).start()
+📌 Messaggio utente:
+--------------------
+{user_message}
+--------------------
 
-def genera_risposta_gpt(prompt):
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=300
+Genera una risposta finale naturale, chiara, amichevole MA PROFESSIONALE.
+"""
+
+    completion = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
     )
-    return response.choices[0].message['content'].strip()
+
+    return completion.choices[0].message["content"]
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_bot():
-    from_number = request.form.get('From')
-    msg = request.form.get('Body', '').strip()
-    session = SESSIONS.get(from_number, {"stato": "inizio"})
-    response = MessagingResponse()
+    user_message = request.form.get("Body")
+    reply_text = analyze_message(user_message)
 
-    # Comando di GPT per capire intent
-    prompt = f"""
-Sei un assistente di giardinaggio. Analizza questo messaggio del cliente e identifica:
-1. Se vuole fare una domanda generale (rispondi con 'domanda')
-2. Se vuole un preventivo (rispondi con 'preventivo')
-3. Se vuole prenotare un appuntamento (rispondi con 'appuntamento')
-Puoi anche combinare le azioni in uno stesso messaggio separandole con virgola.
-Messaggio: {msg}
-Rispondi solo con le parole chiave corrispondenti.
-"""
-    intent = genera_risposta_gpt(prompt).lower()
-    
-    reply = ""
-    
-    # Gestione dinamica
-    if "domanda" in intent:
-        reply += genera_risposta_gpt(f"Rispondi educatamente alla domanda di giardinaggio: {msg}\n")
-    
-    if "preventivo" in intent:
-        # Proviamo a estrarre il servizio dal messaggio
-        servizi_richiesti = []
-        for s in SERVIZI.keys():
-            if s in msg.lower():
-                servizi_richiesti.append(s)
-        if not servizi_richiesti:
-            # Chiedi quale servizio
-            reply += "Quale servizio ti interessa tra i seguenti?\n" + ", ".join(SERVIZI.keys())
-            session['stato'] = "attesa_servizio"
-        else:
-            for s in servizi_richiesti:
-                ore = 2  # default se non specificato
-                prezzo = SERVIZI[s] * ore
-                reply += f"Il preventivo per {s} è:\n👉 {ore}h × {SERVIZI[s]} €/h = {prezzo} €\n"
-            reply += "Vuoi anche prenotare un appuntamento?"
-            session['stato'] = "offerta_appuntamento"
-    
-    if "appuntamento" in intent:
-        # Prenotazione automatica sulla prima disponibilità
-        dt_str = DISPONIBILITA[0]
-        dt_start = datetime.datetime.fromisoformat(dt_str)
-        dt_end = dt_start + datetime.timedelta(hours=2)
-        event = {
-            'summary': f"Appuntamento WhatsApp",
-            'start': {'dateTime': dt_start.isoformat(), 'timeZone': 'Europe/Rome'},
-            'end': {'dateTime': dt_end.isoformat(), 'timeZone': 'Europe/Rome'},
-        }
-        calendar_service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-        APPUNTAMENTI.append({
-            'numero': from_number,
-            'servizio': "Generico",
-            'datetime': dt_start,
-            'reminder_sent': False
-        })
-        reply += f"\nHo prenotato un appuntamento il {dt_start.strftime('%d/%m/%Y %H:%M')}."
-        session['stato'] = "inizio"
-    
-    # Gestione caso attesa servizio
-    if session.get('stato') == "attesa_servizio":
-        for s in SERVIZI.keys():
-            if s in msg.lower():
-                ore = 2
-                prezzo = SERVIZI[s] * ore
-                reply = f"Il preventivo per {s} è:\n👉 {ore}h × {SERVIZI[s]} €/h = {prezzo} €\nVuoi anche prenotare un appuntamento?"
-                session['stato'] = "offerta_appuntamento"
-    
-    SESSIONS[from_number] = session
-    if not reply:
-        reply = "Non ho capito, puoi ripetere per favore?"
-    response.message(reply)
+    response = MessagingResponse()
+    response.message(reply_text)
     return str(response)
 
+
+@app.route("/")
+def home():
+    return "Bot attivo."
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=8080)
