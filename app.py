@@ -3,24 +3,24 @@ from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 import openai
 import os
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 import datetime
 import threading
 import time
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-import requests
 
 app = Flask(__name__)
 
-# -------------------- Config --------------------
+# Twilio setup
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
+# OpenAI setup
 openai.api_key = os.getenv("OPENAI_API_KEY")
-GOOGLE_MAPS_KEY = os.getenv("GOOGLE_MAPS_KEY")  # Chiave API per Distance Matrix
 
+# Google Calendar setup
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 SERVICE_ACCOUNT_FILE = 'credentials.json'
 credentials = service_account.Credentials.from_service_account_file(
@@ -28,7 +28,7 @@ credentials = service_account.Credentials.from_service_account_file(
 calendar_service = build('calendar', 'v3', credentials=credentials)
 CALENDAR_ID = 'primary'
 
-# -------------------- Servizi e prezzi --------------------
+# Servizi e prezzi aggiornati
 SERVIZI = {
     "taglio prato": 25,
     "potatura siepi": 30,
@@ -40,153 +40,94 @@ SERVIZI = {
     "smaltimento verde": 15
 }
 
-# Slot disponibili (esempio)
-DISPONIBILITA = [
-    "2025-12-10T10:00:00",
-    "2025-12-10T14:00:00",
-    "2025-12-11T09:00:00"
-]
-
-# Punto di riferimento per distanza
-BASE_LOCATION = "Selvazzano Dentro, Padova, Italy"
-
-# Stato clienti e appuntamenti
-SESSIONS = {}
+# Lista appuntamenti
 APPUNTAMENTI = []
 
-# -------------------- Thread Promemoria --------------------
+# Funzione per trovare slot liberi
+def trova_slot_libero(durata_ore):
+    oggi = datetime.datetime.now()
+    for i in range(14):  # controlla per i prossimi 14 giorni
+        giorno = oggi + datetime.timedelta(days=i)
+        for ora in [9, 11, 14, 16]:  # orari disponibili
+            start = giorno.replace(hour=ora, minute=0, second=0, microsecond=0)
+            end = start + datetime.timedelta(hours=durata_ore)
+            occupato = False
+            for appu in APPUNTAMENTI:
+                if not (end <= appu['start'] or start >= appu['end']):
+                    occupato = True
+                    break
+            if not occupato:
+                return start, end
+    return None, None
+
+# Thread promemoria
 def promemoria_worker():
     while True:
         now = datetime.datetime.now()
         for appu in APPUNTAMENTI:
-            dt_app = appu['datetime']
-            numero = appu['numero']
-            if not appu.get('reminder_sent', False) and 0 <= (dt_app - now).total_seconds() <= 86400:
-                messaggio = f"Promemoria: il tuo appuntamento per {appu['servizio']} è domani alle {dt_app.strftime('%H:%M')}."
+            if not appu.get('reminder_sent') and 0 <= (appu['start'] - now).total_seconds() <= 86400:
                 twilio_client.messages.create(
-                    body=messaggio,
+                    body=f"Promemoria: il tuo appuntamento per {appu['servizio']} è domani alle {appu['start'].strftime('%H:%M')}.",
                     from_=f'whatsapp:{TWILIO_WHATSAPP_NUMBER}',
-                    to=numero
+                    to=appu['numero']
                 )
                 appu['reminder_sent'] = True
         time.sleep(3600)
 
 threading.Thread(target=promemoria_worker, daemon=True).start()
 
-# -------------------- Funzioni --------------------
-def estrai_servizio(msg):
-    prompt = f"""
-    Identifica uno dei seguenti servizi nel testo: {', '.join(SERVIZI.keys())}.
-    Rispondi solo con il nome del servizio o 'nessuno'.
-    Testo: {msg}
-    """
-    response = openai.Completion.create(
-        model="text-davinci-003",
-        prompt=prompt,
-        max_tokens=20
-    )
-    servizio = response.choices[0].text.strip().lower()
-    if servizio in SERVIZI:
-        return servizio
-    return None
-
-def stima_durata(servizio):
-    prompt = f"Sei un giardiniere esperto. Stima in ore il tempo medio per completare '{servizio}'. Rispondi solo con un numero decimale."
-    response = openai.Completion.create(
-        model="text-davinci-003",
-        prompt=prompt,
-        max_tokens=5
-    )
-    try:
-        ore = float(response.choices[0].text.strip())
-        return max(1, ore)
-    except:
-        return 2
-
-def distanza_da_base(indirizzo_dest):
-    url = f"https://maps.googleapis.com/maps/api/distancematrix/json?origins={BASE_LOCATION}&destinations={indirizzo_dest}&key={GOOGLE_MAPS_KEY}"
-    r = requests.get(url).json()
-    try:
-        distanza = r['rows'][0]['elements'][0]['distance']['value']  # metri
-        return distanza
-    except:
-        return 10000  # se fallisce, assume 10 km
-
-def scegli_slot_libero_ottimizzato(ore, indirizzo_cliente=None):
-    ora_corrente = datetime.datetime.now()
-    slot_disponibili = []
-    for s in DISPONIBILITA:
-        dt_slot = datetime.datetime.fromisoformat(s)
-        if dt_slot >= ora_corrente + datetime.timedelta(minutes=30):
-            overlap = False
-            for a in APPUNTAMENTI:
-                a_start = a['datetime']
-                a_end = a_start + datetime.timedelta(hours=a['ore'])
-                dt_end = dt_slot + datetime.timedelta(hours=ore)
-                if (dt_slot < a_end and dt_end > a_start):
-                    overlap = True
-                    break
-            if not overlap:
-                slot_disponibili.append(dt_slot)
-    
-    if indirizzo_cliente and slot_disponibili:
-        # Ordina gli slot in base alla distanza (approssimata)
-        slot_disponibili.sort(key=lambda dt: distanza_da_base(indirizzo_cliente))
-    
-    return slot_disponibili[0] if slot_disponibili else None
-
-# -------------------- Endpoint WhatsApp --------------------
-@app.route("/bot", methods=["POST"])
+@app.route("/whatsapp", methods=["POST"])
 def whatsapp_bot():
     from_number = request.form.get('From')
-    msg = request.form.get('Body', '').lower()
-    response = MessagingResponse()
-    
-    session = SESSIONS.get(from_number, {"mode": "idle"})
-    
-    servizio = estrai_servizio(msg)
-    
-    if servizio:
-        ore = stima_durata(servizio)
-        prezzo = SERVIZI[servizio] * ore
-        
-        # Inserisci l'indirizzo del cliente se disponibile nel messaggio
-        indirizzo_cliente = None  # eventualmente estrarre dall'utente
-        dt_slot = scegli_slot_libero_ottimizzato(ore, indirizzo_cliente)
-        
-        if dt_slot:
-            dt_end = dt_slot + datetime.timedelta(hours=ore)
-            event = {
-                'summary': f"{servizio} - Cliente WhatsApp",
-                'start': {'dateTime': dt_slot.isoformat(), 'timeZone': 'Europe/Rome'},
-                'end': {'dateTime': dt_end.isoformat(), 'timeZone': 'Europe/Rome'},
-            }
-            calendar_service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-            
-            APPUNTAMENTI.append({
-                'numero': from_number,
-                'servizio': servizio,
-                'datetime': dt_slot,
-                'ore': ore,
-                'reminder_sent': False
-            })
-            
-            reply = f"Ho prenotato automaticamente il servizio '{servizio}' per te.\nOrario: {dt_slot.strftime('%d/%m/%Y %H:%M')}\nDurata stimata: {ore}h\nPrezzo: {prezzo}€ ✅"
-        else:
-            reply = "Mi dispiace, non ci sono slot liberi al momento. Ti ricontatterò appena possibile."
-    else:
-        prompt = f"Sei un giardiniere esperto a Padova. Rispondi educatamente al seguente messaggio: {msg}"
-        gpt_response = openai.Completion.create(
-            model="text-davinci-003",
-            prompt=prompt,
-            max_tokens=250
-        )
-        reply = gpt_response.choices[0].text.strip()
-    
-    SESSIONS[from_number] = session
-    response.message(reply)
-    return str(response)
+    msg = request.form.get('Body', '')
+
+    # Chiamata a ChatGPT per capire intenzione e rispondere
+    prompt = f"""
+Sei un assistente intelligente di giardinaggio. 
+Il cliente scrive: "{msg}"
+Rispondi educatamente e chiaramente. 
+Se il cliente chiede preventivi o appuntamenti, proponi servizi da questo elenco con prezzi orari:
+{SERVIZI}
+Se vuole prenotare, scegli automaticamente la prima data disponibile e comunica la conferma. 
+Se fa domande generiche (es. quando tagliare il ginco biloba), rispondi correttamente.
+Rispodi in italiano.
+"""
+
+    response_gpt = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=300
+    )
+
+    reply = response_gpt.choices[0].message.content.strip()
+
+    # Controllo se il GPT ha chiesto prenotazione
+    for servizio in SERVIZI.keys():
+        if servizio in msg.lower():
+            # trova prima disponibilità
+            match = [int(s) for s in msg.split() if s.replace('.','',1).isdigit()]
+            ore = match[0] if match else 2
+            start, end = trova_slot_libero(ore)
+            if start:
+                # Salva su Google Calendar
+                event = {
+                    'summary': f"{servizio} - Cliente WhatsApp",
+                    'start': {'dateTime': start.isoformat(), 'timeZone': 'Europe/Rome'},
+                    'end': {'dateTime': end.isoformat(), 'timeZone': 'Europe/Rome'},
+                }
+                calendar_service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
+                APPUNTAMENTI.append({
+                    'numero': from_number,
+                    'servizio': servizio,
+                    'start': start,
+                    'end': end,
+                    'reminder_sent': False
+                })
+                reply += f"\n\nAppuntamento confermato per {servizio} il {start.strftime('%d/%m/%Y %H:%M')}."
+
+    twilio_resp = MessagingResponse()
+    twilio_resp.message(reply)
+    return str(twilio_resp)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
