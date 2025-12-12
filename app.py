@@ -5,7 +5,6 @@ import os, re, json, sqlite3
 import datetime as dt
 from zoneinfo import ZoneInfo
 
-# Google Calendar
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -18,7 +17,7 @@ TZ = ZoneInfo("Europe/Rome")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY mancante nelle variabili d'ambiente.")
-client = OpenAI(api_key=OPENAI_API_KEY)
+ai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
@@ -38,7 +37,7 @@ CONFIRM_WORDS = {"ok", "va bene", "confermo", "confermiamo", "sì", "si", "perfe
 SERVICES = {
     "taglio prato": 25,
     "potatura siepi": 30,
-    "potatura alberi": 35,          # include ulivo come "alberi"
+    "potatura alberi": 35,      # include ulivo
     "potatura su corda": 60,
     "trattamenti antiparassitari": 40,
     "pulizia giardino": 28,
@@ -47,7 +46,7 @@ SERVICES = {
 }
 
 # =========================
-# DB
+# DB (session + memoria lunga)
 # =========================
 def db_conn():
     conn = sqlite3.connect(DB_PATH)
@@ -57,14 +56,12 @@ def db_conn():
 def init_db():
     conn = db_conn()
     cur = conn.cursor()
-
     cur.execute("""
     CREATE TABLE IF NOT EXISTS sessions (
         phone TEXT PRIMARY KEY,
         updated_at TEXT NOT NULL,
         state_json TEXT NOT NULL
     )""")
-
     cur.execute("""
     CREATE TABLE IF NOT EXISTS jobs_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,7 +74,6 @@ def init_db():
         start_iso TEXT,
         end_iso TEXT
     )""")
-
     conn.commit()
     conn.close()
 
@@ -90,25 +86,22 @@ def load_session(phone: str) -> dict:
     row = cur.fetchone()
     conn.close()
     if not row:
-        # default state
         return {
-            "phase": "idle",              # idle | collecting | quoting | proposing_slot | awaiting_confirm
-            "jobs": [],                   # list of jobs dict
-            "current_job": 0,             # index
-            "pending_question": None,     # last question asked
-            "proposed_slot": None,        # {"start": iso, "end": iso}
-            "history": []                 # short memory: last N turns
+            "phase": "IDLE",                 # IDLE | COLLECTING | QUOTED | BOOK_PREF | BOOK_CONFIRM
+            "jobs": [],                      # list jobs
+            "pending": None,                 # {"job_i":int, "field":str}
+            "proposed_slot": None,           # {"start":iso,"end":iso}
+            "short_history": []              # last N turns
         }
     try:
         return json.loads(row["state_json"])
     except Exception:
         return {
-            "phase": "idle",
+            "phase": "IDLE",
             "jobs": [],
-            "current_job": 0,
-            "pending_question": None,
+            "pending": None,
             "proposed_slot": None,
-            "history": []
+            "short_history": []
         }
 
 def save_session(phone: str, state: dict):
@@ -124,8 +117,7 @@ def save_session(phone: str, state: dict):
     conn.commit()
     conn.close()
 
-def save_history_record(phone: str, jobs: list, total_hours: float, total_quote: float,
-                        event_id: str | None, start_iso: str | None, end_iso: str | None):
+def save_history(phone: str, jobs: list, total_hours: float, total_quote: float, event_id: str|None, start_iso: str|None, end_iso: str|None):
     conn = db_conn()
     cur = conn.cursor()
     cur.execute("""
@@ -167,8 +159,8 @@ def last_history_summary(phone: str, limit: int = 2) -> str:
                 when = d.strftime("%d/%m/%Y %H:%M")
             except Exception:
                 when = r["start_iso"]
-        out.append(f"- Lavori: {r['jobs_json']} • Totale: {round(r['total_quote_eur'],2)}€{' • ' + when if when else ''}")
-    return "Storico recente:\n" + "\n".join(out)
+        out.append(f"- {r['jobs_json']} • {round(r['total_quote_eur'],2)}€" + (f" • {when}" if when else ""))
+    return "Storico:\n" + "\n".join(out)
 
 # =========================
 # GOOGLE CALENDAR
@@ -201,7 +193,7 @@ def freebusy(time_min: dt.datetime, time_max: dt.datetime):
     intervals.sort(key=lambda x: x[0])
     return intervals
 
-def next_work_windows(days_ahead=10):
+def next_work_windows(days_ahead=14):
     now = dt.datetime.now(TZ)
     windows = []
     for i in range(days_ahead):
@@ -216,33 +208,72 @@ def next_work_windows(days_ahead=10):
             windows.append((start, end))
     return windows
 
-def find_first_slot(duration_hours: float):
+def find_slot(duration_hours: float, day_pref: str|None = None, part_pref: str|None = None, start_at: dt.time|None = None):
+    """
+    Cerca uno slot CONTIGUO di durata_hours.
+    day_pref: ISO date 'YYYY-MM-DD' oppure None
+    part_pref: 'mattina'|'pomeriggio'|None
+    start_at: orario di inizio minimo (es. 14:00) oppure None
+    """
     duration = dt.timedelta(hours=float(duration_hours))
-    windows = next_work_windows(10)
+    windows = next_work_windows()
+
+    if day_pref:
+        try:
+            d = dt.date.fromisoformat(day_pref)
+            windows = [(w0, w1) for (w0, w1) in windows if w0.date() == d]
+        except Exception:
+            pass
+
+    def slice_part(w0, w1):
+        if part_pref == "mattina":
+            a = dt.datetime(w0.year, w0.month, w0.day, WORK_START_HOUR, 0, tzinfo=TZ)
+            b = dt.datetime(w0.year, w0.month, w0.day, 13, 0, tzinfo=TZ)
+            return max(w0, a), min(w1, b)
+        if part_pref == "pomeriggio":
+            a = dt.datetime(w0.year, w0.month, w0.day, 14, 0, tzinfo=TZ)
+            b = dt.datetime(w0.year, w0.month, w0.day, WORK_END_HOUR, 0, tzinfo=TZ)
+            return max(w0, a), min(w1, b)
+        return w0, w1
+
     if not windows:
         return None
+
     overall_min = windows[0][0]
     overall_max = windows[-1][1]
     busy = freebusy(overall_min, overall_max)
 
-    for w_start, w_end in windows:
-        cursor = w_start
+    for w0, w1 in windows:
+        w0, w1 = slice_part(w0, w1)
+        if w0 >= w1:
+            continue
+
+        if start_at:
+            candidate = dt.datetime(w0.year, w0.month, w0.day, start_at.hour, start_at.minute, tzinfo=TZ)
+            if candidate > w0:
+                w0 = candidate
+            if w0 >= w1:
+                continue
+
+        cursor = w0
         for b_start, b_end in busy:
             if b_end <= cursor:
                 continue
-            if b_start >= w_end:
+            if b_start >= w1:
                 break
-            free_end = min(b_start, w_end)
+            free_end = min(b_start, w1)
             if free_end - cursor >= duration:
                 return (cursor, cursor + duration)
             cursor = max(cursor, b_end)
-            if cursor >= w_end:
+            if cursor >= w1:
                 break
-        if w_end - cursor >= duration:
+
+        if w1 - cursor >= duration:
             return (cursor, cursor + duration)
+
     return None
 
-def create_calendar_event(summary, description, start_dt, end_dt):
+def create_event(summary, description, start_dt, end_dt):
     if not calendar_service:
         return None
     event = {
@@ -255,135 +286,26 @@ def create_calendar_event(summary, description, start_dt, end_dt):
     return created.get("id")
 
 # =========================
-# AI: extraction (JSON)
+# CHECKLIST (dati obbligatori per preventivo serio)
 # =========================
-EXTRACT_SYSTEM = f"""
-Sei un assistente per un giardiniere. Devi estrarre informazioni strutturate dal messaggio.
-Rispondi SOLO con JSON valido, senza testo extra.
-
-Servizi possibili:
-{list(SERVICES.keys())}
-
-Se trovi "ulivo", consideralo come "potatura alberi" e metti specie="ulivo".
-Se trovi più lavori, elencali tutti.
-"""
-
-def ai_extract(message: str, short_history: list, long_history: str):
-    schema = {
-        "intent": "info|quote|book|mixed",
-        "jobs": [
-            {
-                "service": "potatura siepi",
-                "species": "ulivo|...|null",
-                "length_m": 0,
-                "height_m": 0.0,
-                "area_m2": 0,
-                "count": 0,
-                "waste": "si|no|non_so",
-                "access": "facile|medio|difficile|non_so",
-                "notes": "string"
-            }
-        ],
-        "booking": {
-            "wants_booking": True,
-            "time_pref": "domani|settimana prossima|non so|null"
-        },
-        "question": "se è domanda botanica, mettila qui, altrimenti null"
-    }
-
-    prompt = f"""
-Restituisci SOLO JSON.
-Schema:
-{json.dumps(schema, ensure_ascii=False)}
-
-Memoria breve (ultimi messaggi):
-{json.dumps(short_history[-6:], ensure_ascii=False)}
-
-Memoria lunga (storico):
-{long_history or ""}
-
-Messaggio utente:
-{message}
-"""
-
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": EXTRACT_SYSTEM},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-        max_tokens=380,
-    )
-    txt = completion.choices[0].message.content.strip()
-    try:
-        return json.loads(txt)
-    except Exception:
-        m = re.search(r"\{.*\}", txt, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except Exception:
-                pass
-    return {"intent": "mixed", "jobs": [], "booking": {"wants_booking": False, "time_pref": None}, "question": None}
-
-# =========================
-# BOTANIC AI (freeform)
-# =========================
-BOTANIC_SYSTEM = """
-Sei un assistente WhatsApp professionale per un giardiniere.
-Parla SOLO di giardinaggio e piante. Risposte pratiche, concise e affidabili.
-Se serve sopralluogo, dillo.
-"""
-
-def ai_botanic_answer(message: str, short_history: list, long_history: str):
-    prompt = f"""
-Memoria breve:
-{json.dumps(short_history[-6:], ensure_ascii=False)}
-
-Storico:
-{long_history or ""}
-
-Cliente:
-{message}
-
-Rispondi solo in ambito giardinaggio.
-"""
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": BOTANIC_SYSTEM},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.35,
-        max_tokens=450,
-    )
-    return completion.choices[0].message.content.strip()
-
-# =========================
-# CHECKLIST (dati obbligatori per preventivi seri)
-# =========================
-def required_fields_for(job: dict):
-    s = job.get("service")
-    req = []
-    if s == "potatura siepi":
-        req = ["length_m", "height_m", "access", "waste"]
-    elif s == "potatura alberi":
-        # ulivo incluso
-        req = ["count", "access", "waste"]
-    elif s == "taglio prato":
-        req = ["area_m2", "access"]
-    elif s == "pulizia giardino":
-        req = ["area_m2", "waste", "access"]
-    elif s == "raccolta foglie":
-        req = ["area_m2", "waste"]
-    elif s == "smaltimento verde":
-        req = ["notes"]  # volume/numero sacchi in notes
-    elif s == "trattamenti antiparassitari":
-        req = ["notes"]  # tipo pianta + problema in notes
-    else:
-        req = ["notes"]
-    return req
+def required_fields(service: str):
+    if service == "potatura siepi":
+        return ["length_m", "height_m", "access", "waste", "obstacles", "parking"]
+    if service == "potatura alberi":
+        return ["count", "size", "access", "waste", "obstacles", "parking"]
+    if service == "potatura su corda":
+        return ["count", "height_m", "access", "waste", "obstacles", "parking"]
+    if service == "taglio prato":
+        return ["area_m2", "access", "slope", "edges"]
+    if service == "pulizia giardino":
+        return ["area_m2", "waste", "access", "notes"]
+    if service == "raccolta foglie":
+        return ["area_m2", "waste", "notes"]
+    if service == "smaltimento verde":
+        return ["volume", "access"]
+    if service == "trattamenti antiparassitari":
+        return ["plant", "problem", "area_m2"]
+    return ["notes"]
 
 def is_missing(job: dict, field: str):
     v = job.get(field)
@@ -391,391 +313,443 @@ def is_missing(job: dict, field: str):
         return not isinstance(v, int) or v <= 0
     if field == "height_m":
         return not isinstance(v, (int, float)) or v <= 0
-    if field in {"access", "waste"}:
-        return v not in {"facile", "medio", "difficile", "si", "no"} and v not in {"facile","medio","difficile"} and v not in {"si","no","non_so"}
-    if field == "notes":
+    if field in {"access"}:
+        return v not in {"facile", "medio", "difficile"}
+    if field in {"waste"}:
+        return v not in {"si", "no"}
+    if field in {"obstacles", "parking", "slope", "edges"}:
+        return v is None
+    if field in {"size"}:
+        return v not in {"piccolo", "medio", "grande"}
+    if field in {"volume"}:
+        return not v or len(str(v).strip()) < 2
+    if field in {"plant", "problem"}:
+        return not v or len(str(v).strip()) < 2
+    if field in {"notes"}:
         return not v or len(str(v).strip()) < 3
     return v is None
 
-def next_missing_question(job: dict):
+def question_for(service: str, field: str):
+    # Siepi
+    if service == "potatura siepi":
+        if field == "length_m": return "Quanti metri è lunga la siepe circa?"
+        if field == "height_m": return "Altezza media della siepe? (es. 1,5m / 2m / 3m)"
+        if field == "access": return "Accesso com’è? (facile / medio / difficile)"
+        if field == "waste": return "Vuoi anche lo smaltimento del verde? (sì/no)"
+        if field == "obstacles": return "Ci sono ostacoli (muretti, cancelli stretti, scale, aiuole delicate)? (sì/no)"
+        if field == "parking": return "Si riesce a parcheggiare vicino per caricare il verde? (sì/no)"
+    # Alberi/ulivi
+    if service == "potatura alberi":
+        if field == "count": return "Quanti alberi/ulivi sono da potare?"
+        if field == "size": return "Dimensione alberi? (piccolo / medio / grande)"
+        if field == "access": return "Accesso com’è? (facile / medio / difficile)"
+        if field == "waste": return "Vuoi anche lo smaltimento del verde? (sì/no)"
+        if field == "obstacles": return "Ci sono ostacoli (linee, tettoie, aiuole, spazi stretti)? (sì/no)"
+        if field == "parking": return "Si riesce a parcheggiare vicino? (sì/no)"
+    # Corda
+    if service == "potatura su corda":
+        if field == "count": return "Quanti alberi da fare in corda?"
+        if field == "height_m": return "Altezza indicativa degli alberi? (metri)"
+        if field == "access": return "Accesso com’è? (facile / medio / difficile)"
+        if field == "waste": return "Vuoi anche lo smaltimento del verde? (sì/no)"
+        if field == "obstacles": return "Ci sono ostacoli (cavi, tetti, spazi stretti)? (sì/no)"
+        if field == "parking": return "Si riesce a parcheggiare vicino? (sì/no)"
+    # Prato
+    if service == "taglio prato":
+        if field == "area_m2": return "Quanti mq circa di prato? (es. 200)"
+        if field == "access": return "Accesso com’è? (facile / medio / difficile)"
+        if field == "slope": return "Il terreno è in pendenza? (sì/no)"
+        if field == "edges": return "Serve anche rifinitura bordi/contorni? (sì/no)"
+    # Pulizia
+    if service == "pulizia giardino":
+        if field == "area_m2": return "Quanto è grande l’area da pulire? (mq circa)"
+        if field == "waste": return "Vuoi anche lo smaltimento del verde? (sì/no)"
+        if field == "access": return "Accesso com’è? (facile / medio / difficile)"
+        if field == "notes": return "Che tipo di pulizia serve? (erbacce, rami, rovi, generale…)"
+    # Foglie
+    if service == "raccolta foglie":
+        if field == "area_m2": return "Su che area circa? (mq)"
+        if field == "waste": return "Vuoi anche lo smaltimento del verde? (sì/no)"
+        if field == "notes": return "Le foglie sono leggere o molto bagnate/compattate? (dimmi due righe)"
+    # Smaltimento
+    if service == "smaltimento verde":
+        if field == "volume": return "Quanto verde da smaltire circa? (es. 10 sacchi / 1 m³ / rimorchio pieno)"
+        if field == "access": return "Accesso com’è? (facile / medio / difficile)"
+    # Trattamenti
+    if service == "trattamenti antiparassitari":
+        if field == "plant": return "Che pianta è? (es. rose, ulivo, siepe…)"
+        if field == "problem": return "Che problema vedi? (afidi, cocciniglia, macchie, ingiallimento…)"
+        if field == "area_m2": return "Quanta superficie/numero piante circa?"
+    return "Mi dai un dettaglio in più (misure, accesso, smaltimento, note)?"
+
+def next_missing(job: dict):
     s = job.get("service")
-    for f in required_fields_for(job):
+    for f in required_fields(s):
         if is_missing(job, f):
-            if s == "potatura siepi":
-                if f == "length_m":
-                    return "Quanti metri è lunga la siepe circa?"
-                if f == "height_m":
-                    return "Altezza media della siepe? (es. 1,5m / 2m / 3m)"
-                if f == "access":
-                    return "Accesso com’è? (facile = spazio e accesso comodi / medio / difficile)"
-                if f == "waste":
-                    return "Vuoi anche smaltimento del verde? (sì/no)"
-            if s == "potatura alberi":
-                if f == "count":
-                    return "Quanti alberi/ulivi sono da potare?"
-                if f == "access":
-                    return "Accesso com’è? (facile / medio / difficile)"
-                if f == "waste":
-                    return "Vuoi anche smaltimento del verde? (sì/no)"
-            if s == "taglio prato":
-                if f == "area_m2":
-                    return "Quanti mq circa di prato? (es. 200 mq)"
-                if f == "access":
-                    return "Accesso com’è? (facile / medio / difficile)"
-            if s == "pulizia giardino":
-                if f == "area_m2":
-                    return "Quanto è grande l’area da pulire? (mq circa)"
-                if f == "waste":
-                    return "Vuoi anche smaltimento del verde? (sì/no)"
-                if f == "access":
-                    return "Accesso com’è? (facile / medio / difficile)"
-            if s == "raccolta foglie":
-                if f == "area_m2":
-                    return "Su che area circa? (mq)"
-                if f == "waste":
-                    return "Vuoi anche smaltimento del verde? (sì/no)"
-            if s == "trattamenti antiparassitari":
-                return "Che pianta è e che problema vedi? (es. afidi, cocciniglia, foglie macchiate)"
-            if s == "smaltimento verde":
-                return "Indicami circa quanto verde da smaltire (es. 10 sacchi / 1 m³)."
-            return "Mi dai un dettaglio in più sul lavoro (misure, accesso, smaltimento)?"
+            return f
     return None
 
 # =========================
-# STIMA ORE (deterministica e prudente)
+# STIMA ORE + QUOTE (deterministico, prudente)
 # =========================
+def access_factor(access: str):
+    if access == "medio": return 1.15
+    if access == "difficile": return 1.35
+    return 1.0
+
+def bool_extra(val: str, yes_add: float):
+    return yes_add if val == "si" else 0.0
+
 def estimate_hours(job: dict):
-    s = job.get("service")
-    access = job.get("access")
-    waste = job.get("waste")
+    s = job["service"]
+    rate = SERVICES.get(s, 30)
 
-    access_factor = 1.0
-    if access == "medio":
-        access_factor = 1.15
-    elif access == "difficile":
-        access_factor = 1.35
+    af = access_factor(job.get("access", "facile"))
 
-    waste_extra = 0.0
-    if waste == "si":
-        waste_extra = 0.6  # mezz’ora/1h extra medio (poi si affina)
+    # “extra” tempo per condizioni
+    waste_extra = bool_extra(job.get("waste"), 0.8)
+    obstacles_extra = 0.4 if job.get("obstacles") == "si" else 0.0
+    parking_extra = 0.3 if job.get("parking") == "no" else 0.0
 
     if s == "potatura siepi":
-        length_m = int(job.get("length_m") or 0)
-        height_m = float(job.get("height_m") or 0)
-
-        # velocità prudente in m/h (dipende dall’altezza)
-        if height_m <= 1.5:
-            speed = 55
-        elif height_m <= 2.5:
-            speed = 38
-        else:
-            speed = 28
-
+        length_m = job.get("length_m", 0)
+        height_m = job.get("height_m", 0.0)
+        # velocità prudente m/h
+        if height_m <= 1.5: speed = 55
+        elif height_m <= 2.5: speed = 38
+        else: speed = 28
         base = max(2.0, round(length_m / speed, 1))
-        return round(base * access_factor + waste_extra, 1)
+        return round(base * af + waste_extra + obstacles_extra + parking_extra, 1), rate
 
     if s == "potatura alberi":
-        count = int(job.get("count") or 0)
-        # potatura ulivo tipica: 1.5h–3h cad, prudente 2.2h
-        per_tree = 2.2
+        count = job.get("count", 0)
+        size = job.get("size", "medio")
+        per_tree = 1.8 if size == "piccolo" else (2.6 if size == "medio" else 3.6)
         base = max(1.5, round(count * per_tree, 1))
-        return round(base * access_factor + waste_extra, 1)
+        return round(base * af + waste_extra + obstacles_extra + parking_extra, 1), rate
+
+    if s == "potatura su corda":
+        count = job.get("count", 0)
+        height_m = job.get("height_m", 0.0)
+        per_tree = 3.5 if height_m <= 12 else 4.8
+        base = max(3.0, round(count * per_tree, 1))
+        return round(base * af + waste_extra + obstacles_extra + parking_extra, 1), rate
 
     if s == "taglio prato":
-        area = int(job.get("area_m2") or 0)
-        base = max(1.0, round(area / 350, 1))  # 350 mq/h prudente
-        return round(base * access_factor, 1)
+        area = job.get("area_m2", 0)
+        slope_extra = 0.5 if job.get("slope") == "si" else 0.0
+        edges_extra = 0.4 if job.get("edges") == "si" else 0.0
+        base = max(1.0, round(area / 350, 1))
+        return round(base * af + slope_extra + edges_extra, 1), rate
 
     if s == "pulizia giardino":
-        area = int(job.get("area_m2") or 0)
+        area = job.get("area_m2", 0)
         base = max(2.0, round(area / 200, 1))
-        return round(base * access_factor + waste_extra, 1)
+        return round(base * af + waste_extra, 1), rate
 
     if s == "raccolta foglie":
-        area = int(job.get("area_m2") or 0)
+        area = job.get("area_m2", 0)
         base = max(1.5, round(area / 250, 1))
-        return round(base * access_factor + waste_extra, 1)
-
-    if s == "trattamenti antiparassitari":
-        # senza dati, stima prudente
-        return round(2.0 * access_factor, 1)
+        wet_extra = 0.4 if "bagn" in (job.get("notes","").lower()) else 0.0
+        return round(base * af + waste_extra + wet_extra, 1), rate
 
     if s == "smaltimento verde":
-        return 1.5
+        base = 1.5
+        return round(base * af, 1), rate
 
-    return 2.0
+    if s == "trattamenti antiparassitari":
+        base = 2.0
+        return round(base * af, 1), rate
+
+    return 2.0, rate
 
 def calc_quote(job: dict):
-    s = job.get("service")
-    rate = SERVICES.get(s, 30)
-    hours = estimate_hours(job)
-    total = round(rate * hours, 2)
-    return rate, hours, total
+    hours, rate = estimate_hours(job)
+    total = round(hours * rate, 2)
+    return hours, rate, total
 
-def jobs_ready(jobs: list):
-    # tutti i jobs hanno tutti i required compilati
-    for j in jobs:
-        if not j.get("service"):
-            return False
-        q = next_missing_question(j)
-        if q:
-            return False
-    return True
-
-def total_estimate(jobs: list):
+def totals(jobs: list):
     total_h = 0.0
     total_e = 0.0
     breakdown = []
     for j in jobs:
-        rate, hours, eur = calc_quote(j)
-        total_h += hours
-        total_e += eur
-        breakdown.append((j["service"], hours, rate, eur))
+        h, r, e = calc_quote(j)
+        total_h += h
+        total_e += e
+        breakdown.append((j["service"], h, r, e))
     return round(total_h, 1), round(total_e, 2), breakdown
 
 # =========================
-# UTIL: normalize updates from user
+# PARSE user answers for pending field (no more losing context)
 # =========================
-def parse_int_maybe(text):
+def parse_int(text):
     m = re.search(r"(\d+)", text)
     return int(m.group(1)) if m else None
 
-def parse_float_maybe(text):
+def parse_float(text):
     m = re.search(r"(\d+(?:[.,]\d+)?)", text)
     return float(m.group(1).replace(",", ".")) if m else None
 
-def apply_user_answer_to_job(job: dict, question: str, user_text: str):
-    low = user_text.lower().strip()
+def yn(text):
+    t = text.lower().strip()
+    if t in {"si", "sì", "ok", "va bene", "certo"}: return "si"
+    if "no" in t: return "no"
+    return None
 
-    # euristiche: se chiediamo "metri" -> length_m
-    if "metri" in question.lower():
-        v = parse_int_maybe(low)
-        if v:
-            job["length_m"] = v
-            return
+def parse_access(text):
+    t = text.lower()
+    if "facile" in t: return "facile"
+    if "medio" in t: return "medio"
+    if "diffic" in t: return "difficile"
+    return None
 
-    if "altezza" in question.lower():
-        v = parse_float_maybe(low)
-        if v and v <= 10:
-            job["height_m"] = v
-            return
+def parse_size(text):
+    t = text.lower()
+    if "piccol" in t: return "piccolo"
+    if "medio" in t: return "medio"
+    if "grand" in t: return "grande"
+    return None
 
-    if "quanti" in question.lower() and ("alberi" in question.lower() or "ulivi" in question.lower()):
-        v = parse_int_maybe(low)
-        if v:
-            job["count"] = v
-            return
-
-    if "mq" in question.lower() or "metri quad" in question.lower():
-        v = parse_int_maybe(low)
-        if v:
-            job["area_m2"] = v
-            return
-
-    if "accesso" in question.lower():
-        if "facile" in low:
-            job["access"] = "facile"
-            return
-        if "medio" in low:
-            job["access"] = "medio"
-            return
-        if "diffic" in low:
-            job["access"] = "difficile"
-            return
-
-    if "smalt" in question.lower():
-        if low in {"si", "sì", "ok", "va bene", "certo"}:
-            job["waste"] = "si"
-            return
-        if "no" in low:
-            job["waste"] = "no"
-            return
-
-    # fallback notes
-    job["notes"] = user_text.strip()
+def apply_pending(job: dict, field: str, user_text: str):
+    t = user_text.strip()
+    if field in {"length_m", "area_m2", "count"}:
+        v = parse_int(t)
+        if v: job[field] = v
+        return
+    if field == "height_m":
+        v = parse_float(t)
+        if v and v <= 50: job[field] = v
+        return
+    if field == "access":
+        v = parse_access(t)
+        if v: job[field] = v
+        return
+    if field == "waste":
+        v = yn(t)
+        if v: job[field] = v
+        return
+    if field in {"obstacles", "parking", "slope", "edges"}:
+        v = yn(t)
+        if v: job[field] = v
+        return
+    if field == "size":
+        v = parse_size(t)
+        if v: job[field] = v
+        return
+    if field == "volume":
+        if len(t) >= 2: job[field] = t
+        return
+    if field in {"plant", "problem", "notes"}:
+        if len(t) >= 2: job[field] = t
+        return
 
 # =========================
-# MAIN WHATSAPP WEBHOOK
+# AI extraction (solo per capire quali lavori ci sono)
+# =========================
+EXTRACT_SYSTEM = f"""
+Sei un assistente per un giardiniere.
+Devi estrarre SOLO: quali lavori/servizi l'utente vuole (anche multipli).
+Rispondi SOLO JSON valido. Niente testo extra.
+
+Servizi disponibili:
+{list(SERVICES.keys())}
+
+Regole:
+- "ulivo" -> "potatura alberi" e specie="ulivo"
+- "siepe" -> "potatura siepi"
+- "erba/prato" -> "taglio prato"
+- "corda" -> "potatura su corda"
+"""
+
+def ai_extract_services(message: str):
+    schema = {"services": [{"service": "potatura siepi", "species": None}]}
+    prompt = f"Messaggio: {message}\nSchema: {json.dumps(schema, ensure_ascii=False)}"
+    c = ai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role":"system","content":EXTRACT_SYSTEM},{"role":"user","content":prompt}],
+        temperature=0.0,
+        max_tokens=200
+    )
+    txt = c.choices[0].message.content.strip()
+    try:
+        return json.loads(txt).get("services", [])
+    except Exception:
+        m = re.search(r"\{.*\}", txt, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0)).get("services", [])
+            except Exception:
+                pass
+    return []
+
+def normalize_service(s: str, species: str|None):
+    s = (s or "").lower().strip()
+    if species and str(species).lower().strip() == "ulivo":
+        return "potatura alberi", "ulivo"
+    if "ulivo" in s:
+        return "potatura alberi", "ulivo"
+    if s in SERVICES:
+        return s, species
+    if "siepe" in s:
+        return "potatura siepi", species
+    if "prato" in s or "erba" in s:
+        return "taglio prato", species
+    if "corda" in s:
+        return "potatura su corda", species
+    if "alber" in s:
+        return "potatura alberi", species
+    if "foglie" in s:
+        return "raccolta foglie", species
+    if "pulizia" in s:
+        return "pulizia giardino", species
+    if "smalt" in s:
+        return "smaltimento verde", species
+    if "antipar" in s or "tratt" in s:
+        return "trattamenti antiparassitari", species
+    return None, species
+
+# =========================
+# booking preference parsing
+# =========================
+def detect_booking_pref(text: str):
+    low = text.lower()
+    day = None
+    part = None
+    start_time = None
+
+    if "domani" in low:
+        day = (dt.datetime.now(TZ) + dt.timedelta(days=1)).date().isoformat()
+    if "mattina" in low:
+        part = "mattina"
+    if "pomeriggio" in low:
+        part = "pomeriggio"
+
+    m = re.search(r"(?:alle|dalle)\s*(\d{1,2})(?::(\d{2}))?", low)
+    if m:
+        h = int(m.group(1))
+        mm = int(m.group(2)) if m.group(2) else 0
+        start_time = dt.time(hour=h, minute=mm)
+
+    return day, part, start_time
+
+def user_wants_booking(text: str):
+    low = text.lower()
+    return any(k in low for k in ["quando puoi", "quando sei libero", "puoi venire", "passare", "prenot", "appunt"])
+
+# =========================
+# MAIN WEBHOOK
 # =========================
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_bot():
-    phone = request.form.get("From")  # es: whatsapp:+39...
+    phone = request.form.get("From")
     user_message = (request.form.get("Body", "") or "").strip()
     if not user_message:
         user_message = "Ciao"
 
     state = load_session(phone)
-    long_hist = last_history_summary(phone)
-    state["history"].append({"role": "user", "content": user_message})
-    state["history"] = state["history"][-12:]  # limita
+    state["short_history"].append({"u": user_message})
+    state["short_history"] = state["short_history"][-12:]
 
-    # 1) Se stiamo aspettando conferma appuntamento -> OK crea evento
-    if state.get("phase") == "awaiting_confirm" and state.get("proposed_slot"):
-        if user_message.lower() in CONFIRM_WORDS:
+    # A) se stiamo aspettando conferma per inserire evento
+    if state["phase"] == "BOOK_CONFIRM" and state.get("proposed_slot"):
+        if user_message.lower().strip() in CONFIRM_WORDS:
             slot = state["proposed_slot"]
             start_dt = dt.datetime.fromisoformat(slot["start"]).astimezone(TZ)
             end_dt = dt.datetime.fromisoformat(slot["end"]).astimezone(TZ)
 
-            total_h, total_e, breakdown = total_estimate(state["jobs"])
+            total_h, total_e, breakdown = totals(state["jobs"])
 
             event_id = None
             if calendar_service:
-                summary = "Lavori giardino - Cliente WhatsApp"
-                desc_lines = [f"Cliente: {phone}", f"Totale ore stimate: {total_h}", f"Totale indicativo: {total_e}€", ""]
+                desc_lines = [f"Cliente: {phone}", f"Totale ore: {total_h}", f"Totale indicativo: {total_e}€", ""]
                 for s, h, r, e in breakdown:
                     desc_lines.append(f"- {s}: {h}h × {r}€/h = {e}€")
-                desc = "\n".join(desc_lines)
-                try:
-                    event_id = create_calendar_event(summary, desc, start_dt, end_dt)
-                except Exception:
-                    event_id = None
+                event_id = create_event("Lavori giardino (WhatsApp)", "\n".join(desc_lines), start_dt, end_dt)
 
-            save_history_record(
-                phone=phone,
-                jobs=state["jobs"],
-                total_hours=total_h,
-                total_quote=total_e,
-                event_id=event_id,
-                start_iso=start_dt.isoformat(),
-                end_iso=end_dt.isoformat(),
-            )
+            save_history(phone, state["jobs"], total_h, total_e, event_id, start_dt.isoformat(), end_dt.isoformat())
 
             reply = (
-                f"✅ Appuntamento confermato!\n"
-                f"📅 {start_dt.strftime('%d/%m/%Y %H:%M')} (durata {total_h}h)\n"
+                f"✅ Confermato! Ho inserito l’appuntamento in agenda:\n"
+                f"📅 {start_dt.strftime('%d/%m/%Y %H:%M')} → {end_dt.strftime('%H:%M')} (durata {total_h}h)\n"
                 f"💶 Totale indicativo: {total_e}€\n\n"
-                "Se vuoi, mandami indirizzo e qualche foto (siepe/ulivo) così arrivo già preparato.\n"
-                "Nota: il prezzo finale può variare leggermente dopo sopralluogo (accessi, spazi, smaltimento reale)."
+                "Nota: il prezzo finale può variare leggermente dopo sopralluogo (accessi/ostacoli/smaltimento reale)."
             )
 
-            # reset session (ma lasciamo history breve pulita)
-            state = {
-                "phase": "idle",
-                "jobs": [],
-                "current_job": 0,
-                "pending_question": None,
-                "proposed_slot": None,
-                "history": state["history"][-6:]
-            }
+            # reset
+            state = {"phase":"IDLE","jobs":[],"pending":None,"proposed_slot":None,"short_history":state["short_history"][-6:]}
             save_session(phone, state)
 
             resp = MessagingResponse()
             resp.message(reply)
             return str(resp)
 
-    # 2) Se stavamo raccogliendo dati e avevamo una domanda pendente -> applica risposta
-    if state.get("phase") == "collecting" and state.get("pending_question") and state.get("jobs"):
-        j = state["jobs"][state.get("current_job", 0)]
-        apply_user_answer_to_job(j, state["pending_question"], user_message)
-        state["pending_question"] = None
-
-    # 3) Estrazione: capire intent + eventuali nuovi lavori (anche multipli)
-    extracted = ai_extract(user_message, state["history"], long_hist)
-
-    intent = extracted.get("intent") or "mixed"
-    jobs_from_ai = extracted.get("jobs") or []
-    wants_booking = bool((extracted.get("booking") or {}).get("wants_booking"))
-
-    # 4) Se è domanda botanica pura e non stiamo facendo preventivi -> rispondi bene
-    if intent == "info" and not jobs_from_ai and not state.get("jobs"):
-        reply = ai_botanic_answer(user_message, state["history"], long_hist)
-        state["history"].append({"role": "assistant", "content": reply})
+    # B) se abbiamo una domanda pendente -> applica risposta al campo giusto
+    if state["phase"] == "COLLECTING" and state.get("pending"):
+        job_i = state["pending"]["job_i"]
+        field = state["pending"]["field"]
+        job = state["jobs"][job_i]
+        apply_pending(job, field, user_message)
+        state["pending"] = None
         save_session(phone, state)
-        resp = MessagingResponse()
-        resp.message(reply)
-        return str(resp)
 
-    # 5) Merge lavori: se AI trova lavori, aggiungili o aggiorna quelli esistenti
-    # Normalizza job base
-    def normalize_job(j):
-        service = (j.get("service") or "").lower().strip()
-        # alias: ulivo -> potatura alberi
-        if j.get("species") and str(j["species"]).lower().strip() == "ulivo":
-            service = "potatura alberi"
-        if "ulivo" in (j.get("notes") or "").lower():
-            service = "potatura alberi"
-            j["species"] = "ulivo"
-        if service not in SERVICES:
-            # fallback: prova a mappare
-            if "siepe" in service:
-                service = "potatura siepi"
-            elif "prato" in service:
-                service = "taglio prato"
-            elif "corda" in service:
-                service = "potatura su corda"
-            elif "alber" in service or "ulivo" in service:
-                service = "potatura alberi"
-            else:
-                service = None
-        return {
-            "service": service,
-            "species": j.get("species"),
-            "length_m": int(j.get("length_m") or 0),
-            "height_m": float(j.get("height_m") or 0.0),
-            "area_m2": int(j.get("area_m2") or 0),
-            "count": int(j.get("count") or 0),
-            "waste": (j.get("waste") or "non_so"),
-            "access": (j.get("access") or "non_so"),
-            "notes": (j.get("notes") or "").strip()
-        }
+    # C) Se non abbiamo lavori, estrai servizi dal messaggio
+    if not state["jobs"]:
+        services = ai_extract_services(user_message)
+        for item in services:
+            svc, species = normalize_service(item.get("service"), item.get("species"))
+            if not svc:
+                continue
+            state["jobs"].append({
+                "service": svc,
+                "species": species,
+                "length_m": 0,
+                "height_m": 0.0,
+                "area_m2": 0,
+                "count": 0,
+                "waste": None,
+                "access": None,
+                "obstacles": None,
+                "parking": None,
+                "size": None,
+                "slope": None,
+                "edges": None,
+                "volume": None,
+                "plant": None,
+                "problem": None,
+                "notes": ""
+            })
 
-    if jobs_from_ai:
-        new_jobs = [normalize_job(j) for j in jobs_from_ai]
-        # se non avevamo job in corso, impostali
-        if not state.get("jobs"):
-            # filtra quelli senza service
-            state["jobs"] = [j for j in new_jobs if j.get("service")]
-            state["current_job"] = 0
-        else:
-            # aggiorna: per semplicità append se service diverso
-            existing_services = {j.get("service") for j in state["jobs"]}
-            for j in new_jobs:
-                if j.get("service") and j["service"] not in existing_services:
-                    state["jobs"].append(j)
-
-    # Se ancora nessun lavoro riconosciuto -> chiedi
-    if not state.get("jobs"):
+    # Se ancora zero lavori -> chiedi cosa serve
+    if not state["jobs"]:
         reply = (
-            "Certo 😊 Mi dici che lavoro ti serve?\n"
-            "Esempi: potatura siepi, potatura alberi/ulivo, taglio prato, pulizia giardino, raccolta foglie, smaltimento verde."
+            "Ciao! 😊 Dimmi pure cosa ti serve.\n"
+            "Esempi: potatura siepi, potatura ulivi/alberi, taglio prato, pulizia giardino, raccolta foglie, smaltimento verde, trattamenti antiparassitari."
         )
-        state["phase"] = "idle"
-        state["history"].append({"role": "assistant", "content": reply})
+        state["phase"] = "IDLE"
         save_session(phone, state)
         resp = MessagingResponse()
         resp.message(reply)
         return str(resp)
 
-    # 6) Raccolta dati obbligatori: una domanda alla volta (non va in tilt)
-    # trova il primo job con campi mancanti
-    missing_job_idx = None
-    missing_q = None
-    for idx, job in enumerate(state["jobs"]):
-        q = next_missing_question(job)
-        if q:
-            missing_job_idx = idx
-            missing_q = q
-            break
+    # D) Se manca qualche dato obbligatorio, chiedi (una domanda alla volta)
+    for i, job in enumerate(state["jobs"]):
+        miss = next_missing(job)
+        if miss:
+            state["phase"] = "COLLECTING"
+            state["pending"] = {"job_i": i, "field": miss}
 
-    if missing_q:
-        state["phase"] = "collecting"
-        state["current_job"] = missing_job_idx
-        state["pending_question"] = missing_q
+            lead = ""
+            if len(state["jobs"]) > 1:
+                lead = f"Perfetto, per un preventivo preciso partiamo da **{job['service']}**.\n"
 
-        # se ci sono più lavori, guidiamo: "Ora siepe, poi ulivo"
-        lead = ""
-        if len(state["jobs"]) > 1:
-            lead = f"Perfetto, così ti faccio un preventivo più preciso. Partiamo da **{state['jobs'][missing_job_idx]['service']}**.\n"
+            reply = lead + question_for(job["service"], miss)
+            save_session(phone, state)
+            resp = MessagingResponse()
+            resp.message(reply)
+            return str(resp)
 
-        reply = lead + missing_q
-        state["history"].append({"role": "assistant", "content": reply})
-        save_session(phone, state)
-        resp = MessagingResponse()
-        resp.message(reply)
-        return str(resp)
-
-    # 7) A questo punto abbiamo dati sufficienti -> preventivo completo (multi-lavoro)
-    total_h, total_e, breakdown = total_estimate(state["jobs"])
+    # E) Ora abbiamo tutti i dati -> preventivo deterministico
+    total_h, total_e, breakdown = totals(state["jobs"])
 
     lines = []
     for s, h, r, e in breakdown:
@@ -783,30 +757,28 @@ def whatsapp_bot():
     breakdown_txt = "\n".join(lines)
 
     quote_msg = (
-        "Perfetto ✅ Ecco una stima indicativa (da confermare al sopralluogo se emergono difficoltà/accessi/smaltimento maggiore):\n\n"
+        "✅ Preventivo indicativo (più accurato possibile con i dati forniti):\n\n"
         f"{breakdown_txt}\n\n"
         f"Totale stimato: **{total_h} ore** — **{total_e}€**\n"
+        "Nota: confermo definitivamente dopo sopralluogo se emergono difficoltà non visibili (accessi, ostacoli, smaltimento reale)."
     )
 
-    # 8) Prenotazione: se l’utente la chiede ORA, oppure se scrive “quando puoi venire”
-    low = user_message.lower()
-    implied_booking = any(k in low for k in ["quando puoi", "quando sei libero", "puoi venire", "passare", "appunt", "prenot"])
-
-    if wants_booking or implied_booking:
+    # F) Se l’utente vuole appuntamento / preferenza giorno
+    if user_wants_booking(user_message) or ("domani" in user_message.lower()) or ("pomeriggio" in user_message.lower()) or ("mattina" in user_message.lower()):
         if not calendar_service:
-            reply = quote_msg + "\n📅 Per fissare l’appuntamento: dimmi 2-3 disponibilità (giorno + fascia) e lo confermo."
-            state["phase"] = "quoting"
-            state["history"].append({"role": "assistant", "content": reply})
+            reply = quote_msg + "\n\n📅 Per fissare l’appuntamento: dimmi 2-3 disponibilità (giorno + fascia) e lo confermo."
+            state["phase"] = "QUOTED"
             save_session(phone, state)
             resp = MessagingResponse()
             resp.message(reply)
             return str(resp)
 
-        slot = find_first_slot(total_h)
+        day_pref, part_pref, start_time = detect_booking_pref(user_message)
+
+        slot = find_slot(total_h, day_pref=day_pref, part_pref=part_pref, start_at=start_time)
         if not slot:
-            reply = quote_msg + "\n📅 In questi giorni ho l’agenda piena. Dimmi che giorno preferisci (mattina/pomeriggio) e provo a incastrarlo."
-            state["phase"] = "quoting"
-            state["history"].append({"role": "assistant", "content": reply})
+            reply = quote_msg + "\n\n📅 In quella fascia non ho uno slot abbastanza lungo per finire tutto. Vuoi un altro giorno o fascia (mattina/pomeriggio)?"
+            state["phase"] = "QUOTED"
             save_session(phone, state)
             resp = MessagingResponse()
             resp.message(reply)
@@ -814,25 +786,23 @@ def whatsapp_bot():
 
         start_dt, end_dt = slot
         state["proposed_slot"] = {"start": start_dt.isoformat(), "end": end_dt.isoformat()}
-        state["phase"] = "awaiting_confirm"
+        state["phase"] = "BOOK_CONFIRM"
         save_session(phone, state)
 
         reply = (
             quote_msg
-            + "\n📅 Ho trovato il primo slot libero abbastanza lungo per completare tutto:\n"
-            f"**{start_dt.strftime('%d/%m/%Y %H:%M')}** (durata {total_h}h)\n"
+            + "\n\n📅 Ho trovato uno slot libero abbastanza lungo per completare tutto:\n"
+            f"**{start_dt.strftime('%d/%m/%Y %H:%M')} → {end_dt.strftime('%H:%M')}**\n"
+            f"(durata {total_h}h)\n"
             "Vuoi che lo inserisca in agenda? Rispondi **OK**."
         )
-        state["history"].append({"role": "assistant", "content": reply})
-        save_session(phone, state)
         resp = MessagingResponse()
         resp.message(reply)
         return str(resp)
 
-    # 9) Se non chiede appuntamento: proponi passo successivo
-    reply = quote_msg + "\nVuoi che ti proponga il primo appuntamento libero? Scrivimi: **quando puoi venire?**"
-    state["phase"] = "quoting"
-    state["history"].append({"role": "assistant", "content": reply})
+    # G) Altrimenti proponi di fissare
+    reply = quote_msg + "\n\nVuoi che ti proponga il primo appuntamento libero? Scrivimi: **domani pomeriggio** oppure **quando puoi venire?**"
+    state["phase"] = "QUOTED"
     save_session(phone, state)
     resp = MessagingResponse()
     resp.message(reply)
