@@ -1,26 +1,24 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from openai import OpenAI
-import os, re, json, sqlite3
+import os, re, sqlite3
 import datetime as dt
 from zoneinfo import ZoneInfo
 
-# Google Calendar
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 app = Flask(__name__)
-
 TZ = ZoneInfo("Europe/Rome")
 
 # =========================
-# MEMORIA BREVE (in RAM)
+# MEMORIA BREVE (SESSIONI)
 # =========================
 SESSIONS = {}
-CONFIRM_WORDS = {"ok", "va bene", "confermiamo", "sì", "si", "perfetto", "conferma", "va bene così", "andiamo"}
+CONFIRM_WORDS = {"ok", "va bene", "confermo", "confermiamo", "sì", "si", "perfetto", "vai"}
 
 # =========================
-# OPENAI
+# OPENAI (solo per domande botaniche / tono)
 # =========================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
@@ -42,11 +40,8 @@ SERVICES = {
 }
 
 # =========================
-# GOOGLE CALENDAR (Service Account)
+# GOOGLE CALENDAR
 # =========================
-# Usa credentials.json presente nel progetto (come stai già facendo).
-# IMPORTANTE: il calendario deve essere condiviso con l’email del service account (client_email),
-# con permesso "Modifica eventi".
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
@@ -58,7 +53,6 @@ try:
     )
     calendar_service = build("calendar", "v3", credentials=credentials)
 except Exception:
-    # Se Google non è configurato bene, il bot continuerà a rispondere ma non potrà fissare eventi.
     calendar_service = None
 
 # =========================
@@ -76,16 +70,17 @@ def init_db():
     cur = conn.cursor()
     cur.execute("""
     CREATE TABLE IF NOT EXISTS jobs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        phone TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        service TEXT,
-        details TEXT,
-        hours REAL,
-        quote_eur REAL,
-        calendar_event_id TEXT,
-        start_iso TEXT,
-        end_iso TEXT
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      phone TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      service TEXT,
+      length_m INTEGER,
+      height_m REAL,
+      hours REAL,
+      quote_eur REAL,
+      start_iso TEXT,
+      end_iso TEXT,
+      calendar_event_id TEXT
     )
     """)
     conn.commit()
@@ -93,89 +88,74 @@ def init_db():
 
 init_db()
 
-def save_job(phone, service, details, hours, quote_eur, event_id=None, start_iso=None, end_iso=None):
+def save_job(phone, service, length_m, height_m, hours, quote_eur, start_iso=None, end_iso=None, event_id=None):
     conn = db_conn()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO jobs (phone, created_at, service, details, hours, quote_eur, calendar_event_id, start_iso, end_iso)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO jobs (phone, created_at, service, length_m, height_m, hours, quote_eur, start_iso, end_iso, calendar_event_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         phone,
         dt.datetime.now(TZ).isoformat(),
         service,
-        details,
+        length_m,
+        height_m,
         hours,
         quote_eur,
-        event_id,
         start_iso,
-        end_iso
+        end_iso,
+        event_id
     ))
     conn.commit()
     conn.close()
 
-def last_jobs_summary(phone, limit=3):
+def last_jobs(phone, limit=3):
     conn = db_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT service, details, quote_eur, start_iso
-        FROM jobs
-        WHERE phone = ?
-        ORDER BY id DESC
-        LIMIT ?
+      SELECT service, length_m, height_m, quote_eur, start_iso
+      FROM jobs
+      WHERE phone = ?
+      ORDER BY id DESC
+      LIMIT ?
     """, (phone, limit))
     rows = cur.fetchall()
     conn.close()
     if not rows:
-        return "Nessun lavoro precedente registrato per questo numero."
-    parts = []
+        return ""
+    out = []
     for r in rows:
-        when = r["start_iso"]
-        when_txt = ""
-        if when:
+        when = ""
+        if r["start_iso"]:
             try:
-                d = dt.datetime.fromisoformat(when).astimezone(TZ)
-                when_txt = d.strftime("%d/%m/%Y %H:%M")
+                d = dt.datetime.fromisoformat(r["start_iso"]).astimezone(TZ)
+                when = d.strftime("%d/%m/%Y %H:%M")
             except Exception:
-                when_txt = when
-        parts.append(f"- {r['service'] or 'lavoro'} ({r['details'] or 'dettagli non salvati'})"
-                     f"{' • ' + when_txt if when_txt else ''}"
-                     f"{' • ' + str(round(r['quote_eur'], 2)) + '€' if r['quote_eur'] is not None else ''}")
-    return "Ultimi lavori:\n" + "\n".join(parts)
+                when = r["start_iso"]
+        out.append(f"- {r['service']} ({r['length_m']}m, {r['height_m']}m){' • ' + when if when else ''} • {round(r['quote_eur'], 2)}€")
+    return "Storico lavori:\n" + "\n".join(out)
 
 # =========================
-# ORARI DI LAVORO (semplici)
+# ORARI DI LAVORO
 # =========================
-WORK_DAYS = {0, 1, 2, 3, 4}  # Lun-Ven
-WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "8"))
-WORK_END_HOUR = int(os.getenv("WORK_END_HOUR", "18"))
-SLOT_MINUTES = 30
+WORK_DAYS = {0,1,2,3,4}   # Lun-Ven
+WORK_START = int(os.getenv("WORK_START_HOUR", "8"))
+WORK_END = int(os.getenv("WORK_END_HOUR", "18"))
 
-def next_working_windows(days_ahead=10):
-    """Ritorna finestre lavorative nei prossimi N giorni."""
-    now = dt.datetime.now(TZ)
-    windows = []
-    for i in range(days_ahead):
-        day = (now + dt.timedelta(days=i)).date()
-        if day.weekday() not in WORK_DAYS:
-            continue
-        start = dt.datetime(day.year, day.month, day.day, WORK_START_HOUR, 0, tzinfo=TZ)
-        end = dt.datetime(day.year, day.month, day.day, WORK_END_HOUR, 0, tzinfo=TZ)
-        # se oggi e siamo già oltre lo start, parte da adesso arrotondato
-        if i == 0 and now > start:
-            rounded = now.replace(second=0, microsecond=0)
-            # arrotonda a SLOT_MINUTES
-            minute = (rounded.minute // SLOT_MINUTES + (1 if rounded.minute % SLOT_MINUTES else 0)) * SLOT_MINUTES
-            if minute == 60:
-                rounded = rounded.replace(minute=0) + dt.timedelta(hours=1)
-            else:
-                rounded = rounded.replace(minute=minute)
-            start = max(start, rounded)
-        if start < end:
-            windows.append((start, end))
-    return windows
+def part_of_day_window(date_obj, part):
+    """
+    part: 'mattina' | 'pomeriggio' | None
+    """
+    if part == "mattina":
+        return (dt.datetime(date_obj.year, date_obj.month, date_obj.day, WORK_START, 0, tzinfo=TZ),
+                dt.datetime(date_obj.year, date_obj.month, date_obj.day, 13, 0, tzinfo=TZ))
+    if part == "pomeriggio":
+        return (dt.datetime(date_obj.year, date_obj.month, date_obj.day, 14, 0, tzinfo=TZ),
+                dt.datetime(date_obj.year, date_obj.month, date_obj.day, WORK_END, 0, tzinfo=TZ))
+    return (dt.datetime(date_obj.year, date_obj.month, date_obj.day, WORK_START, 0, tzinfo=TZ),
+            dt.datetime(date_obj.year, date_obj.month, date_obj.day, WORK_END, 0, tzinfo=TZ))
 
-def freebusy_between(time_min, time_max):
-    """Ritorna lista intervalli occupati dal calendario (solo se calendar_service disponibile)."""
+def freebusy(time_min, time_max):
     if not calendar_service:
         return []
     body = {
@@ -188,49 +168,35 @@ def freebusy_between(time_min, time_max):
     busy = fb.get("calendars", {}).get(GOOGLE_CALENDAR_ID, {}).get("busy", [])
     intervals = []
     for b in busy:
-        try:
-            s = dt.datetime.fromisoformat(b["start"].replace("Z", "+00:00")).astimezone(TZ)
-            e = dt.datetime.fromisoformat(b["end"].replace("Z", "+00:00")).astimezone(TZ)
-            intervals.append((s, e))
-        except Exception:
-            pass
+        s = dt.datetime.fromisoformat(b["start"].replace("Z","+00:00")).astimezone(TZ)
+        e = dt.datetime.fromisoformat(b["end"].replace("Z","+00:00")).astimezone(TZ)
+        intervals.append((s,e))
     intervals.sort(key=lambda x: x[0])
     return intervals
 
-def find_first_slot(duration_hours):
-    """Trova primo slot libero in calendario che contenga la durata."""
+def find_slot_in_window(duration_hours, window_start, window_end):
+    """
+    Trova il primo slot libero tra window_start e window_end che contenga durata.
+    """
     duration = dt.timedelta(hours=float(duration_hours))
-    windows = next_working_windows(days_ahead=10)
-    if not windows:
-        return None
-
-    # Intervallo complessivo per freebusy (min->max)
-    overall_min = windows[0][0]
-    overall_max = windows[-1][1]
-    busy = freebusy_between(overall_min, overall_max)
-
-    # Helper: sottrai busy da finestra lavorativa
-    for w_start, w_end in windows:
-        cursor = w_start
-        for b_start, b_end in busy:
-            if b_end <= cursor:
-                continue
-            if b_start >= w_end:
-                break
-            # spazio libero prima dell'occupato
-            free_end = min(b_start, w_end)
-            if free_end - cursor >= duration:
-                return (cursor, cursor + duration)
-            # sposta cursor alla fine del busy
-            cursor = max(cursor, b_end)
-            if cursor >= w_end:
-                break
-        # spazio libero dopo ultimo busy
-        if w_end - cursor >= duration:
-            return (cursor, cursor + duration)
+    busy = freebusy(window_start, window_end)
+    cursor = window_start
+    for b_start, b_end in busy:
+        if b_end <= cursor:
+            continue
+        if b_start >= window_end:
+            break
+        free_end = min(b_start, window_end)
+        if free_end - cursor >= duration:
+            return cursor, cursor + duration
+        cursor = max(cursor, b_end)
+        if cursor >= window_end:
+            break
+    if window_end - cursor >= duration:
+        return cursor, cursor + duration
     return None
 
-def create_calendar_event(summary, description, start_dt, end_dt):
+def create_event(summary, description, start_dt, end_dt):
     if not calendar_service:
         return None
     event = {
@@ -243,141 +209,139 @@ def create_calendar_event(summary, description, start_dt, end_dt):
     return created.get("id")
 
 # =========================
-# AI: estrazione intenzione + dati (robusta)
+# PARSING DETTAGLI (deterministico)
 # =========================
-SYSTEM_PROMPT = f"""
-Sei un assistente WhatsApp professionale dedicato ESCLUSIVAMENTE a un giardiniere.
-Parla solo di giardinaggio, preventivi, appuntamenti, servizi e piante.
+def parse_length_m(text):
+    m = re.search(r"(\d+)\s*metri", text.lower())
+    return int(m.group(1)) if m else None
 
-REGOLE:
-- Se domanda fuori ambito: rifiuta gentilmente e riporta al giardinaggio.
-- Se l’utente chiede preventivo: identifica servizio/i tra quelli disponibili, stima ore se possibile o chiedi 1 dettaglio essenziale.
-- Se l’utente vuole appuntamento: proponi o conferma, usando la disponibilità che ti viene passata dall'app (non inventare date a caso).
+def parse_height_m(text):
+    # supporta "2 metri", "2m", "2,5 metri", "2.5m"
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:m|metri)\s*(?:di\s*altezza|alta|alto)?", text.lower())
+    if not m:
+        # cerca "alta 2"
+        m = re.search(r"alta\s*(\d+(?:[.,]\d+)?)", text.lower())
+    if not m:
+        return None
+    val = float(m.group(1).replace(",", "."))
+    # filtro: se qualcuno scrive "300 metri", non vogliamo considerarlo altezza
+    if val > 10:
+        return None
+    return val
 
-Servizi disponibili e prezzi €/h:
-{SERVICES}
-"""
+def detect_service(text):
+    low = text.lower()
+    for s in SERVICES:
+        if s in low:
+            return s
+    # alias comuni
+    if "siepe" in low:
+        return "potatura siepi"
+    if "prato" in low or "erba" in low:
+        return "taglio prato"
+    if "corda" in low:
+        return "potatura su corda"
+    if "albero" in low or "alberi" in low:
+        return "potatura alberi"
+    if "foglie" in low:
+        return "raccolta foglie"
+    if "smalt" in low:
+        return "smaltimento verde"
+    if "pulizia" in low:
+        return "pulizia giardino"
+    return None
 
-def ai_extract(user_message, history_summary=None, last_jobs=None):
-    """
-    Estrae in JSON: intent, services, details, hours_hint, wants_booking, wants_quote, question.
-    """
-    instruction = {
-        "intent": "info|quote|book|mixed",
-        "services": ["..."],
-        "details": "string breve (es. 'siepe 300 metri, altezza 2m')",
-        "hours_hint": "numero o null",
-        "wants_quote": True,
-        "wants_booking": True,
-        "question": "se è domanda botanica, riportala qui altrimenti null"
-    }
+def detect_time_pref(text):
+    low = text.lower()
+    day = None
+    part = None
+    hour = None
 
-    user = f"""
-Analizza questo messaggio e restituisci SOLO JSON valido, senza testo extra.
-Schema esempio:
-{json.dumps(instruction, ensure_ascii=False)}
+    if "domani" in low:
+        day = (dt.datetime.now(TZ) + dt.timedelta(days=1)).date()
+    elif "oggi" in low:
+        day = dt.datetime.now(TZ).date()
 
-Contesto (se presente):
-- Riepilogo conversazione: {history_summary or "nessuno"}
-- Ultimi lavori: {last_jobs or "nessuno"}
+    if "mattina" in low:
+        part = "mattina"
+    if "pomeriggio" in low:
+        part = "pomeriggio"
 
-Messaggio utente: {user_message}
-"""
-
-    # Tentiamo JSON “pulito”
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.2,
-        max_tokens=300,
-    )
-    text = completion.choices[0].message.content.strip()
-
-    # Parse robusto: prova json diretto, altrimenti estrai blocco
-    try:
-        return json.loads(text)
-    except Exception:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except Exception:
-                pass
-
-    # fallback semplice
-    return {
-        "intent": "mixed",
-        "services": [],
-        "details": None,
-        "hours_hint": None,
-        "wants_quote": True,
-        "wants_booking": True,
-        "question": None,
-    }
-
-def estimate_hours(service, user_message, details):
-    """
-    Stima ore con euristiche semplici (meglio deterministiche che inventate).
-    Se l'utente indica ore, usiamo quelle.
-    """
-    # ore esplicite
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:h|ore|ora)\b", user_message.lower())
+    # "dalle 15", "alle 15", "15:30"
+    m = re.search(r"(?:dalle|alle)\s*(\d{1,2})(?::(\d{2}))?", low)
     if m:
-        return float(m.group(1).replace(",", "."))
+        h = int(m.group(1))
+        mm = int(m.group(2)) if m.group(2) else 0
+        hour = (h, mm)
 
-    text = (user_message + " " + (details or "")).lower()
+    m2 = re.search(r"\b(\d{1,2}):(\d{2})\b", low)
+    if m2:
+        hour = (int(m2.group(1)), int(m2.group(2)))
 
-    # metri per siepe
-    m2 = re.search(r"(\d+)\s*metri", text)
-    if service == "potatura siepi" and m2:
-        meters = int(m2.group(1))
-        # 40 m/h base
-        return max(1.0, round(meters / 40.0, 1))
+    return day, part, hour
 
-    # prato mq
-    mq = re.search(r"(\d+)\s*(?:mq|m2)", text)
-    if service == "taglio prato" and mq:
-        area = int(mq.group(1))
-        # 300 mq/h base
-        return max(1.0, round(area / 300.0, 1))
+# =========================
+# STIMA ORE (siepi dipende molto dall’altezza)
+# =========================
+def estimate_hours(service, length_m=None, height_m=None):
+    if service == "potatura siepi":
+        if not length_m:
+            return 3.0
+        # velocità base in metri/ora in base all'altezza
+        # (valori realistici per NON sottostimare)
+        if height_m is None:
+            speed = 35  # prudente
+        elif height_m <= 1.5:
+            speed = 50
+        elif height_m <= 2.5:
+            speed = 35
+        else:
+            speed = 25
+        return max(2.0, round(length_m / speed, 1))
 
-    # default prudente
+    if service == "taglio prato":
+        return 2.0
+
+    if service == "pulizia giardino":
+        return 3.0
+
+    if service == "raccolta foglie":
+        return 2.0
+
+    if service == "potatura alberi":
+        return 3.0
+
+    if service == "potatura su corda":
+        return 4.0
+
     return 2.0
 
-def format_quote(service, hours):
+def quote(service, hours):
     rate = SERVICES.get(service)
     if rate is None:
-        return None
+        return None, None
     total = round(rate * float(hours), 2)
     return rate, total
 
 # =========================
-# Risposta “specialistica” (con contesto + limiti)
+# AI SOLO PER DOMANDE BOTANICHE / SPIEGAZIONI
 # =========================
-def ai_answer(user_message, history_summary=None, last_jobs=None):
-    prompt = f"""
-Messaggio cliente:
-\"\"\"{user_message}\"\"\"
-
-Contesto:
-- Riepilogo conversazione: {history_summary or "nessuno"}
-- Ultimi lavori: {last_jobs or "nessuno"}
-
-Rispondi in modo chiaro, professionale e SOLO in ambito giardinaggio.
-Se l'utente chiede info su piante, rispondi con consigli pratici.
-Se serve un sopralluogo, dillo.
+BOTANIC_SYSTEM = f"""
+Sei un assistente WhatsApp professionale per un giardiniere.
+Parla SOLO di giardinaggio, piante, manutenzione del verde.
+Se domanda fuori ambito: rifiuta gentilmente e riporta al giardinaggio.
+Rispondi in italiano, pratico, non teorico.
 """
+
+def ai_botanic_answer(user_message, history=""):
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": BOTANIC_SYSTEM},
+            {"role": "user", "content": f"Contesto:\n{history}\n\nMessaggio:\n{user_message}"},
         ],
         temperature=0.3,
-        max_tokens=500,
+        max_tokens=450,
     )
     return completion.choices[0].message.content.strip()
 
@@ -386,228 +350,298 @@ Se serve un sopralluogo, dillo.
 # =========================
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_bot():
-    phone = request.form.get("From")  # es: whatsapp:+39348...
+    phone = request.form.get("From")
     user_message = (request.form.get("Body", "") or "").strip()
     if not user_message:
         user_message = "Ciao"
 
-    # carica sessione breve
     session = SESSIONS.get(phone, {
         "state": "idle",
         "service": None,
-        "details": None,
+        "length_m": None,
+        "height_m": None,
         "hours": None,
         "quote_total": None,
+        "pref_day": None,
+        "pref_part": None,
+        "pref_hour": None,
         "slot_start": None,
-        "slot_end": None
+        "slot_end": None,
     })
 
-    # memoria lunga (ultimi lavori)
-    jobs_summary = last_jobs_summary(phone)
+    history_long = last_jobs(phone)
 
-    # 1) Se siamo in attesa conferma, intercetta conferma / rifiuto
-    if session.get("state") == "awaiting_confirmation":
-        if user_message.lower() in CONFIRM_WORDS:
-            # prova a creare evento
-            if not session.get("slot_start") or not session.get("slot_end"):
-                # se manca slot, ricostruisci e riproponi
-                reply = "Perfetto. Prima di confermare, mi dici se preferisci mattina o pomeriggio nei prossimi giorni?"
-            else:
-                start_dt = dt.datetime.fromisoformat(session["slot_start"]).astimezone(TZ)
-                end_dt = dt.datetime.fromisoformat(session["slot_end"]).astimezone(TZ)
+    # -------------------------
+    # 1) Se stiamo aspettando un orario ("dalle 15") o conferma
+    # -------------------------
+    if session["state"] == "awaiting_time_choice":
+        day, part, hour = detect_time_pref(user_message)
+        # l'utente spesso risponde solo "dalle 15": usa day/part già scelti prima
+        if hour:
+            session["pref_hour"] = hour
+        if part:
+            session["pref_part"] = part
+        if day:
+            session["pref_day"] = day
 
-                # crea evento (se google ok)
-                event_id = None
-                if calendar_service:
-                    summary = f"{session.get('service', 'Lavoro giardino')} - Cliente WhatsApp"
-                    desc = f"Cliente: {phone}\nDettagli: {session.get('details')}\nPreventivo indicativo: {session.get('quote_total')}€"
-                    try:
-                        event_id = create_calendar_event(summary, desc, start_dt, end_dt)
-                    except Exception:
-                        event_id = None
-
-                # salva memoria lunga
-                save_job(
-                    phone=phone,
-                    service=session.get("service"),
-                    details=session.get("details"),
-                    hours=float(session.get("hours") or 0),
-                    quote_eur=float(session.get("quote_total") or 0),
-                    event_id=event_id,
-                    start_iso=start_dt.isoformat(),
-                    end_iso=end_dt.isoformat(),
-                )
-
-                when_txt = start_dt.strftime("%d/%m/%Y %H:%M")
-                reply = (
-                    f"✅ Perfetto! Ho fissato l’appuntamento per **{session.get('service')}** "
-                    f"({session.get('details') or 'dettagli da definire'})\n"
-                    f"📅 **{when_txt}** (durata {session.get('hours')}h)\n"
-                    f"💶 Preventivo indicativo: {session.get('quote_total')}€\n\n"
-                    "Se vuoi aggiungere un indirizzo o dettagli (altezza siepe, accessi, foto), scrivimi pure."
-                )
-
-                # reset sessione breve (non perdere la lunga)
-                session = {
-                    "state": "idle",
-                    "service": None,
-                    "details": None,
-                    "hours": None,
-                    "quote_total": None,
-                    "slot_start": None,
-                    "slot_end": None
-                }
-                SESSIONS[phone] = session
-
-                resp = MessagingResponse()
-                resp.message(reply)
-                return str(resp)
-
-        # se non è conferma, trattalo come messaggio normale ma includendo contesto
-        # (non resettiamo lo stato)
-        # prosegue sotto
-
-    # 2) Estrazione intent/dati
-    extracted = ai_extract(user_message, history_summary=session.get("summary"), last_jobs=jobs_summary)
-
-    # Semplifica: identifica servizio (primo valido)
-    service = None
-    for s in (extracted.get("services") or []):
-        s_low = str(s).lower().strip()
-        if s_low in SERVICES:
-            service = s_low
-            break
-
-    # se non riconosce, prova match “fuzzy” semplice
-    if not service:
-        low = user_message.lower()
-        for s in SERVICES:
-            if s in low:
-                service = s
-                break
-        # alias comuni
-        if not service:
-            if "siepe" in low:
-                service = "potatura siepi"
-            elif "prato" in low or "erba" in low:
-                service = "taglio prato"
-            elif "corda" in low:
-                service = "potatura su corda"
-            elif "albero" in low or "alberi" in low:
-                service = "potatura alberi"
-
-    # details
-    details = extracted.get("details")
-    if not details:
-        # estrai metri/mq come fallback
-        m = re.search(r"(\d+)\s*metri", user_message.lower())
-        if m:
-            details = f"siepe {m.group(1)} metri"
-        mq = re.search(r"(\d+)\s*(?:mq|m2)", user_message.lower())
-        if mq:
-            details = (details + ", " if details else "") + f"prato {mq.group(1)} mq"
-
-    # 3) Se è una domanda tecnica botanica/info → rispondi, ma se chiede anche preventivo/appuntamento continuiamo
-    wants_quote = bool(extracted.get("wants_quote"))
-    wants_booking = bool(extracted.get("wants_booking"))
-
-    # se ha fatto solo una domanda info
-    only_info = (extracted.get("intent") == "info") and not wants_quote and not wants_booking and not service
-    if only_info:
-        reply = ai_answer(user_message, history_summary=session.get("summary"), last_jobs=jobs_summary)
-        resp = MessagingResponse()
-        resp.message(reply)
-        return str(resp)
-
-    # 4) Preventivo: se non abbiamo servizio → chiedi
-    if (wants_quote or extracted.get("intent") in {"quote", "mixed"}) and not service:
-        reply = (
-            "Perfetto 😊 Per farti un preventivo mi dici quale servizio ti serve?\n"
-            "Esempi: taglio prato, potatura siepi, potatura alberi, potatura su corda, pulizia giardino, raccolta foglie, smaltimento verde."
-        )
-        resp = MessagingResponse()
-        resp.message(reply)
-        return str(resp)
-
-    # 5) Calcolo ore e preventivo
-    hours = None
-    quote_total = None
-    rate = None
-    if service:
-        hours = extracted.get("hours_hint") or estimate_hours(service, user_message, details)
-        rate, quote_total = format_quote(service, hours)
-        # salva in memoria breve
-        session["service"] = service
-        session["details"] = details
-        session["hours"] = float(hours)
-        session["quote_total"] = float(quote_total)
-
-    # 6) Se vuole appuntamento (o se ha accettato implicitamente) → trova slot e proponi
-    # Consideriamo booking se:
-    # - wants_booking True
-    # - oppure l'utente dice "prenota/ appuntamento/ quando sei libero"
-    low = user_message.lower()
-    if any(k in low for k in ["appunt", "prenot", "quando sei libero", "disponibil", "puoi venire"]) or wants_booking:
-        if not service:
-            reply = "Certo! Per fissare l’appuntamento mi dici quale lavoro dobbiamo fare? (es. potatura siepi, taglio prato)"
+        # serve almeno il giorno + una fascia (pomeriggio/mattina) o un orario
+        if not session["pref_day"]:
+            reply = "Perfetto 😊 Mi dici che giorno preferisci? (es. domani, lunedì, martedì)"
             resp = MessagingResponse()
             resp.message(reply)
             return str(resp)
 
-        # se Google Calendar non configurato, fallback manuale
+        if not session["pref_part"] and not session["pref_hour"]:
+            reply = "Ottimo. Preferisci mattina o pomeriggio?"
+            resp = MessagingResponse()
+            resp.message(reply)
+            return str(resp)
+
+        # calcolo finestra
+        day_obj = session["pref_day"]
+        if isinstance(day_obj, str):
+            day_obj = dt.date.fromisoformat(day_obj)
+        w_start, w_end = part_of_day_window(day_obj, session["pref_part"])
+
+        # se ha scelto un orario specifico, restringi finestra da quell'ora
+        if session["pref_hour"]:
+            h, m = session["pref_hour"]
+            chosen = dt.datetime(day_obj.year, day_obj.month, day_obj.day, h, m, tzinfo=TZ)
+            if chosen < w_start:
+                chosen = w_start
+            w_start = chosen
+
         if not calendar_service:
-            reply = (
-                f"Perfetto! Per **{service}** ({details or 'dettagli da definire'}) stimerei circa **{hours}h**.\n"
-                f"Preventivo indicativo: **{quote_total}€**.\n\n"
-                "📅 Per l’appuntamento: dimmi tu 2-3 disponibilità (giorno e fascia oraria) e confermo."
-            )
+            reply = "Per ora non riesco a leggere la tua agenda automaticamente. Dimmi tu un paio di orari e confermo manualmente."
             resp = MessagingResponse()
             resp.message(reply)
             return str(resp)
 
-        # trova slot libero
-        slot = find_first_slot(hours)
+        slot = find_slot_in_window(session["hours"], w_start, w_end)
         if not slot:
-            reply = (
-                f"Per **{service}** ({details or 'dettagli da definire'}) stimerei **{hours}h**.\n"
-                f"Preventivo indicativo: **{quote_total}€**.\n\n"
-                "In questi giorni ho l’agenda piena 😅 Dimmi tu che giorno preferisci (mattina/pomeriggio) e provo a incastrarlo."
-            )
+            reply = "In quella fascia non ho uno spazio abbastanza lungo per finire il lavoro. Vuoi provare un altro giorno o un’altra fascia?"
+            session["state"] = "awaiting_day_part"
+            SESSIONS[phone] = session
             resp = MessagingResponse()
             resp.message(reply)
             return str(resp)
 
         start_dt, end_dt = slot
-        when_txt = start_dt.strftime("%d/%m/%Y %H:%M")
         session["slot_start"] = start_dt.isoformat()
         session["slot_end"] = end_dt.isoformat()
         session["state"] = "awaiting_confirmation"
         SESSIONS[phone] = session
 
+        when_txt = start_dt.strftime("%d/%m/%Y %H:%M")
         reply = (
-            f"Perfetto! Per **{service}** ({details or 'dettagli da definire'}) stimerei **{hours}h**.\n"
-            f"💶 Preventivo indicativo: **{quote_total}€** ({rate}€/h)\n\n"
-            f"📅 Ho trovato questo primo slot libero: **{when_txt}**.\n"
-            "Vuoi che lo confermi e lo inserisca in agenda? (rispondi: **OK**)"
+            f"Perfetto ✅ Ho trovato uno slot libero abbastanza lungo:\n"
+            f"📅 **{when_txt}** (durata {session['hours']}h)\n"
+            f"Vuoi che lo confermi e lo inserisca in agenda? Rispondi **OK**."
         )
         resp = MessagingResponse()
         resp.message(reply)
         return str(resp)
 
-    # 7) Se non chiede appuntamento, ma abbiamo fatto preventivo → proponi tu l’opzione
-    if service and quote_total is not None:
-        reply = (
-            f"Per **{service}** ({details or 'dettagli da definire'}) stimerei **{hours}h**.\n"
-            f"💶 Preventivo indicativo: **{quote_total}€** ({rate}€/h).\n\n"
-            "Vuoi anche fissare un appuntamento? Se mi scrivi “quando sei libero” ti propongo il primo slot disponibile."
-        )
+    if session["state"] == "awaiting_confirmation":
+        if user_message.lower() in CONFIRM_WORDS:
+            if not calendar_service:
+                reply = "Non riesco a inserire in agenda in automatico al momento. Dimmi tu un orario e lo segno manualmente."
+                resp = MessagingResponse()
+                resp.message(reply)
+                return str(resp)
+
+            start_dt = dt.datetime.fromisoformat(session["slot_start"]).astimezone(TZ)
+            end_dt = dt.datetime.fromisoformat(session["slot_end"]).astimezone(TZ)
+
+            summary = f"{session['service']} - Cliente WhatsApp"
+            desc = (
+                f"Cliente: {phone}\n"
+                f"Siepe: {session.get('length_m')}m, altezza: {session.get('height_m')}m\n"
+                f"Ore stimate: {session['hours']}\n"
+                f"Preventivo indicativo: {session['quote_total']}€\n"
+            )
+            event_id = None
+            try:
+                event_id = create_event(summary, desc, start_dt, end_dt)
+            except Exception:
+                event_id = None
+
+            save_job(
+                phone=phone,
+                service=session["service"],
+                length_m=session.get("length_m"),
+                height_m=session.get("height_m"),
+                hours=session["hours"],
+                quote_eur=session["quote_total"],
+                start_iso=start_dt.isoformat(),
+                end_iso=end_dt.isoformat(),
+                event_id=event_id
+            )
+
+            reply = (
+                f"✅ Appuntamento confermato!\n"
+                f"📅 {start_dt.strftime('%d/%m/%Y %H:%M')} (durata {session['hours']}h)\n"
+                f"💶 Preventivo indicativo: {session['quote_total']}€\n\n"
+                "Se vuoi, mandami indirizzo e qualche foto della siepe così arrivo già preparato."
+            )
+
+            # reset session breve
+            SESSIONS[phone] = {
+                "state": "idle",
+                "service": None,
+                "length_m": None,
+                "height_m": None,
+                "hours": None,
+                "quote_total": None,
+                "pref_day": None,
+                "pref_part": None,
+                "pref_hour": None,
+                "slot_start": None,
+                "slot_end": None,
+            }
+
+            resp = MessagingResponse()
+            resp.message(reply)
+            return str(resp)
+        # se non è conferma, continua normalmente senza perdere lo stato (es: chiede info)
+        # prosegue...
+
+    # -------------------------
+    # 2) Riconosci intent “appuntamento” / “preventivo” / info
+    # -------------------------
+    low = user_message.lower()
+
+    wants_booking = any(k in low for k in ["quando puoi", "quando sei libero", "passare", "venire", "appunt", "prenot"])
+    wants_quote = any(k in low for k in ["preventivo", "quanto costa", "prezzo", "costo", "mi fai un preventivo"])
+
+    service = detect_service(user_message)
+    length_m = parse_length_m(user_message)
+    height_m = parse_height_m(user_message)
+
+    # aggiorna sessione con quello che trova
+    if service:
+        session["service"] = service
+    if length_m:
+        session["length_m"] = length_m
+    if height_m:
+        session["height_m"] = height_m
+
+    # -------------------------
+    # 3) Se potatura siepi e manca altezza -> chiedi altezza (il tuo punto!)
+    # -------------------------
+    if session["service"] == "potatura siepi" and session["length_m"] and not session["height_m"]:
+        session["state"] = "awaiting_height"
         SESSIONS[phone] = session
+        reply = (
+            f"Perfetto 😊 Ho capito: **potatura siepi** di circa **{session['length_m']} metri**.\n"
+            "Per stimare bene ore e prezzo mi dici l’altezza media?\n"
+            "Esempi: **1 m**, **2 m**, **3 m** (anche approssimativo va benissimo)."
+        )
         resp = MessagingResponse()
         resp.message(reply)
         return str(resp)
 
-    # 8) fallback: risposta informativa controllata
-    reply = ai_answer(user_message, history_summary=session.get("summary"), last_jobs=jobs_summary)
+    if session["state"] == "awaiting_height":
+        h = parse_height_m(user_message)
+        if not h:
+            reply = "Ok! Mi dai solo l’altezza media in metri? (es. 2 m)"
+            resp = MessagingResponse()
+            resp.message(reply)
+            return str(resp)
+        session["height_m"] = h
+        session["state"] = "idle"
+        SESSIONS[phone] = session
+        # ora può fare preventivo accurato
+
+    # -------------------------
+    # 4) Se è una domanda botanica (e non preventivo/appuntamento) -> rispondi via AI
+    # -------------------------
+    is_probably_info = (not wants_quote and not wants_booking and not session["service"])
+    if is_probably_info:
+        reply = ai_botanic_answer(user_message, history_long)
+        resp = MessagingResponse()
+        resp.message(reply)
+        return str(resp)
+
+    # -------------------------
+    # 5) Preventivo deterministico (ore coerenti, NON inventate)
+    # -------------------------
+    if session["service"]:
+        # ore stimate
+        hours = estimate_hours(session["service"], session.get("length_m"), session.get("height_m"))
+        rate, total = quote(session["service"], hours)
+        session["hours"] = hours
+        session["quote_total"] = total
+
+        SESSIONS[phone] = session
+
+        # risposta preventivo
+        details_txt = []
+        if session.get("length_m"):
+            details_txt.append(f"{session['length_m']} m")
+        if session.get("height_m"):
+            details_txt.append(f"altezza {session['height_m']} m")
+        details_str = ", ".join(details_txt) if details_txt else "dettagli da definire"
+
+        preventivo = (
+            f"Perfetto! Per **{session['service']}** ({details_str}) stimerei circa **{hours} ore**.\n"
+            f"💶 {hours}h × {rate}€/h = **{total}€** (preventivo indicativo).\n"
+        )
+
+        # -------------------------
+        # 6) Appuntamento: NON inventiamo slot, usiamo Calendar e durata reale
+        # -------------------------
+        if wants_booking:
+            if not calendar_service:
+                reply = preventivo + "\n📅 Al momento non riesco a leggere l’agenda automaticamente. Dimmi 2-3 disponibilità e confermo."
+                resp = MessagingResponse()
+                resp.message(reply)
+                return str(resp)
+
+            # se l'utente ha indicato preferenze (domani pomeriggio / dalle 15)
+            pref_day, pref_part, pref_hour = detect_time_pref(user_message)
+            if pref_day:
+                session["pref_day"] = pref_day.isoformat()
+            if pref_part:
+                session["pref_part"] = pref_part
+            if pref_hour:
+                session["pref_hour"] = pref_hour
+
+            # se mancano preferenze, chiedile
+            if not session.get("pref_day"):
+                session["state"] = "awaiting_day_part"
+                SESSIONS[phone] = session
+                reply = preventivo + "\n📅 Per fissare l’appuntamento: preferisci **domani** o **settimana prossima**?"
+                resp = MessagingResponse()
+                resp.message(reply)
+                return str(resp)
+
+            if not session.get("pref_part") and not session.get("pref_hour"):
+                session["state"] = "awaiting_time_choice"
+                SESSIONS[phone] = session
+                reply = preventivo + "\nPerfetto. Preferisci **mattina** o **pomeriggio**?"
+                resp = MessagingResponse()
+                resp.message(reply)
+                return str(resp)
+
+            # abbiamo abbastanza per cercare slot: passiamo a awaiting_time_choice e facciamo lo slot sul prossimo messaggio
+            session["state"] = "awaiting_time_choice"
+            SESSIONS[phone] = session
+            reply = preventivo + "\nOk. Dimmi un orario indicativo (es. **dalle 15**) e ti propongo lo slot libero giusto (con durata completa)."
+            resp = MessagingResponse()
+            resp.message(reply)
+            return str(resp)
+
+        # se non chiede appuntamento, proponilo senza inventare
+        reply = preventivo + "\nVuoi anche fissare un appuntamento? Scrivimi: **quando puoi passare**."
+        resp = MessagingResponse()
+        resp.message(reply)
+        return str(resp)
+
+    # -------------------------
+    # fallback
+    # -------------------------
+    reply = ai_botanic_answer(user_message, history_long)
     resp = MessagingResponse()
     resp.message(reply)
     return str(resp)
