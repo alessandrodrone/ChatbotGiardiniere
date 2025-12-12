@@ -2,10 +2,8 @@ from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from openai import OpenAI
 import os
-import re
 
 app = Flask(__name__)
-
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # =========================
@@ -14,7 +12,7 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 SESSIONS = {}
 
 # =========================
-# PREZZI
+# PREZZI ORARI
 # =========================
 PRICES = {
     "siepe": 30,
@@ -22,9 +20,9 @@ PRICES = {
 }
 
 # =========================
-# DOMANDE OBBLIGATORIE
+# CHECKLIST OBBLIGATORIE
 # =========================
-QUESTIONS = {
+CHECKLIST = {
     "siepe": [
         ("metri", "Quanti metri è lunga la siepe?"),
         ("altezza", "Qual è l’altezza media della siepe (in metri)?"),
@@ -39,30 +37,15 @@ QUESTIONS = {
 }
 
 # =========================
-# GPT SOLO PER INFO
-# =========================
-def risposta_informativa(domanda):
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "Sei un giardiniere esperto."},
-            {"role": "user", "content": domanda}
-        ],
-        max_tokens=300,
-        temperature=0.4
-    )
-    return completion.choices[0].message.content
-
-# =========================
-# SESSION HANDLER
+# SESSIONE
 # =========================
 def get_session(num):
     if num not in SESSIONS:
         SESSIONS[num] = {
-            "fase": "inizio",
+            "fase": "raccolta_lavori",
             "lavori": [],
             "lavoro_corrente": None,
-            "indice_domanda": 0,
+            "campo_corrente": 0,
             "dati": {}
         }
     return SESSIONS[num]
@@ -75,76 +58,71 @@ def whatsapp_bot():
     from_number = request.form.get("From")
     msg = request.form.get("Body", "").lower().strip()
     session = get_session(from_number)
-
     response = MessagingResponse()
 
     # =========================
-    # RISPOSTE INFORMATIVE (sempre possibili)
+    # FASE 1 – RACCOLTA LAVORI
     # =========================
-    if session["fase"] != "inizio" and "quando" in msg or "come" in msg:
-        info = risposta_informativa(msg)
-        response.message(info + "\n\nTorniamo un attimo al preventivo 😊")
-        return str(response)
-
-    # =========================
-    # INIZIO
-    # =========================
-    if session["fase"] == "inizio":
+    if session["fase"] == "raccolta_lavori":
         if "siepe" in msg:
             session["lavori"].append("siepe")
         if "ulivo" in msg:
             session["lavori"].append("ulivi")
 
-        if session["lavori"]:
-            session["fase"] = "dettagli"
-            session["lavoro_corrente"] = session["lavori"][0]
-            session["dati"][session["lavoro_corrente"]] = {}
-            session["indice_domanda"] = 0
-
-            _, domanda = QUESTIONS[session["lavoro_corrente"]][0]
-            response.message(domanda)
+        if not session["lavori"]:
+            response.message("Dimmi pure che lavori di giardinaggio devi fare 😊")
             return str(response)
 
-        response.message("Dimmi pure che lavori di giardinaggio devi fare 😊")
+        session["lavoro_corrente"] = session["lavori"][0]
+        session["dati"][session["lavoro_corrente"]] = {}
+        session["campo_corrente"] = 0
+        session["fase"] = "raccolta_dettagli"
+
+        _, domanda = CHECKLIST[session["lavoro_corrente"]][0]
+        response.message(domanda)
         return str(response)
 
     # =========================
-    # RACCOLTA DETTAGLI
+    # FASE 2 – RACCOLTA DETTAGLI
     # =========================
-    if session["fase"] == "dettagli":
+    if session["fase"] == "raccolta_dettagli":
         lavoro = session["lavoro_corrente"]
-        key, _ = QUESTIONS[lavoro][session["indice_domanda"]]
-        session["dati"][lavoro][key] = msg
-        session["indice_domanda"] += 1
+        campo, _ = CHECKLIST[lavoro][session["campo_corrente"]]
+        session["dati"][lavoro][campo] = msg
+        session["campo_corrente"] += 1
 
-        if session["indice_domanda"] < len(QUESTIONS[lavoro]):
-            _, domanda = QUESTIONS[lavoro][session["indice_domanda"]]
+        # Se ci sono ancora campi
+        if session["campo_corrente"] < len(CHECKLIST[lavoro]):
+            _, domanda = CHECKLIST[lavoro][session["campo_corrente"]]
             response.message(domanda)
             return str(response)
 
-        # lavoro completato
+        # Passa al prossimo lavoro
         session["lavori"].pop(0)
-        session["indice_domanda"] = 0
 
         if session["lavori"]:
             session["lavoro_corrente"] = session["lavori"][0]
             session["dati"][session["lavoro_corrente"]] = {}
-            _, domanda = QUESTIONS[session["lavoro_corrente"]][0]
+            session["campo_corrente"] = 0
+            _, domanda = CHECKLIST[session["lavoro_corrente"]][0]
             response.message(domanda)
             return str(response)
 
         # =========================
-        # PREVENTIVO
+        # FASE 3 – PREVENTIVO
         # =========================
-        ore = 8
-        prezzo_min = ore * 30
-        prezzo_max = prezzo_min + 80
-
         session["fase"] = "preventivo"
+
+        ore_siepe = 6
+        ore_ulivi = 2 if "ulivi" in session["dati"] else 0
+        ore_totali = ore_siepe + ore_ulivi
+
+        prezzo_min = ore_totali * 30
+        prezzo_max = prezzo_min + 80
 
         response.message(
             f"Perfetto 👍\n"
-            f"In base ai dati raccolti il lavoro richiede circa {ore} ore.\n"
+            f"In base ai dati raccolti il lavoro richiederà circa {ore_totali}–{ore_totali + 1} ore.\n"
             f"Il preventivo indicativo è tra **{prezzo_min}€ e {prezzo_max}€**, "
             f"da confermare dopo sopralluogo.\n\n"
             f"Vuoi fissare un appuntamento?"
@@ -152,18 +130,19 @@ def whatsapp_bot():
         return str(response)
 
     # =========================
-    # APPUNTAMENTO
+    # FASE 4 – APPUNTAMENTO
     # =========================
     if session["fase"] == "preventivo" and "si" in msg:
         session["fase"] = "appuntamento"
         response.message(
             "Perfetto! Serve una mezza giornata intera.\n"
-            "Posso venire domani mattina oppure domani pomeriggio.\n"
+            "Posso venire domani mattina (8:00–14:00) oppure domani pomeriggio (13:00–19:00).\n"
             "Cosa preferisci?"
         )
         return str(response)
 
-    response.message("Dimmi pure 😊")
+    # =========================
+    response.message("Se hai altre domande sul giardino, sono qui 😊")
     return str(response)
 
 # =========================
